@@ -1,0 +1,6 @@
+@export main():
+L_ENTRY:
+  ; This example is intentionally minimal.
+  ; Invoke the host-side plugin with:
+  ;   sa http-client get https://example.com
+  panic(0)
