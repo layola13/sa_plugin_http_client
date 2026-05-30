@@ -130,6 +130,63 @@ test "http client plugin exports runtime descriptor and loopback GET works" {
     std.testing.allocator.destroy(loopback.done);
 }
 
+test "http client saasm api exposes response headers" {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try std.testing.allocator.create(std.net.Server);
+    server.* = try address.listen(.{ .reuse_address = true });
+    defer std.testing.allocator.destroy(server);
+
+    const done_flag = try std.testing.allocator.create(bool);
+    done_flag.* = false;
+    defer std.testing.allocator.destroy(done_flag);
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(listen_server: *std.net.Server, finished: *bool) void {
+            defer listen_server.deinit();
+            var conn = listen_server.accept() catch return;
+            defer conn.stream.close();
+            var request_buffer: [4096]u8 = undefined;
+            var http_server = std.http.Server.init(conn, &request_buffer);
+            const request = http_server.receiveHead() catch return;
+            _ = request;
+            conn.stream.writeAll(
+                "HTTP/1.1 418 I'm a teapot\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
+            ) catch return;
+            finished.* = true;
+        }
+    }.run, .{ server, done_flag });
+
+    var client: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_new(0, &client));
+    defer _ = plugin.sa_http_client_free(client);
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/headers", .{server.listen_address.getPort()});
+    defer std.testing.allocator.free(url);
+    var req: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_new(client, 1, url.ptr, url.len, &req));
+    defer _ = plugin.sa_http_client_req_free(req);
+
+    var resp: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_send(req, &resp));
+    defer _ = plugin.sa_http_client_resp_free(resp);
+
+    try std.testing.expectEqual(@as(u16, 418), plugin.sa_http_client_resp_status(resp));
+
+    const key = "content-type";
+    var value_ptr: ?[*]const u8 = null;
+    var value_len: u64 = 0;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_get_header(resp, key.ptr, key.len, &value_ptr, &value_len));
+    try std.testing.expectEqualStrings("application/json", (value_ptr orelse return error.NullHeader)[0..@intCast(value_len)]);
+
+    var body_ptr: ?[*]const u8 = null;
+    var body_len: u64 = 0;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
+    try std.testing.expectEqualStrings("{}", (body_ptr orelse return error.NullBody)[0..@intCast(body_len)]);
+
+    thread.join();
+    try std.testing.expect(done_flag.*);
+}
+
 test "http client plugin stream command forwards chunked SSE body incrementally" {
     var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();

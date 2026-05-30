@@ -107,10 +107,17 @@ pub const HttpRequest = struct {
 pub const HttpResponse = struct {
     allocator: std.mem.Allocator,
     status: u16,
+    headers: []std.http.Header,
     body: []u8,
 
     fn deinit(self: *HttpResponse) void {
+        for (self.headers) |header| {
+            self.allocator.free(header.name);
+            self.allocator.free(header.value);
+        }
+        self.allocator.free(self.headers);
         if (self.body.len != 0) self.allocator.free(self.body);
+        self.headers = &.{};
         self.body = &.{};
         self.status = 0;
         self.allocator.destroy(self);
@@ -141,12 +148,33 @@ fn mapStatus(status: std.http.Status) u16 {
     return @intCast(@intFromEnum(status));
 }
 
-fn makeStatusResponse(allocator: std.mem.Allocator, status: u16, body: []u8) !*HttpResponse {
+fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.Response) ![]std.http.Header {
+    var headers = std.ArrayList(std.http.Header).init(allocator);
+    errdefer {
+        for (headers.items) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+        headers.deinit();
+    }
+
+    var it = response.iterateHeaders();
+    while (it.next()) |header| {
+        try headers.append(.{
+            .name = try allocator.dupe(u8, header.name),
+            .value = try allocator.dupe(u8, header.value),
+        });
+    }
+    return headers.toOwnedSlice();
+}
+
+fn makeStatusResponse(allocator: std.mem.Allocator, status: u16, headers: []std.http.Header, body: []u8) !*HttpResponse {
     const resp = try allocator.create(HttpResponse);
     errdefer allocator.destroy(resp);
     resp.* = .{
         .allocator = allocator,
         .status = status,
+        .headers = headers,
         .body = body,
     };
     return resp;
@@ -180,7 +208,15 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
         if (n == 0) break;
         try body.appendSlice(buf[0..n]);
     }
-    return try makeStatusResponse(req.allocator, mapStatus(request.response.status), try body.toOwnedSlice());
+    const headers = try cloneResponseHeaders(req.allocator, request.response);
+    errdefer {
+        for (headers) |header| {
+            req.allocator.free(header.name);
+            req.allocator.free(header.value);
+        }
+        req.allocator.free(headers);
+    }
+    return try makeStatusResponse(req.allocator, mapStatus(request.response.status), headers, try body.toOwnedSlice());
 }
 
 fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.ArrayList(u8) {
@@ -256,6 +292,33 @@ pub export fn sa_http_client_req_send(req: ?*anyopaque, out_resp: ?*?*anyopaque)
 pub export fn sa_http_client_resp_status(resp: ?*anyopaque) u16 {
     const response = resp orelse return 0;
     return @as(*HttpResponse, @ptrCast(@alignCast(response))).status;
+}
+
+pub export fn sa_http_client_resp_get_header(resp: ?*anyopaque, key_ptr: ?[*]const u8, key_len: u64, out_val_ptr: ?*?[*]const u8, out_val_len: ?*u64) u32 {
+    const resp_ptr = resp orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const key = key_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const value_slot = out_val_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const len_slot = out_val_len orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const response = @as(*HttpResponse, @ptrCast(@alignCast(resp_ptr)));
+    const wanted = key[0..@intCast(key_len)];
+    for (response.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, wanted)) {
+            value_slot.* = header.value.ptr;
+            len_slot.* = header.value.len;
+            return @intFromEnum(plugin_api.AbiStatus.ok);
+        }
+    }
+    return @intFromEnum(plugin_api.AbiStatus.failed);
+}
+
+pub export fn sa_http_client_resp_body_slice(resp: ?*anyopaque, out_body_ptr: ?*?[*]const u8, out_body_len: ?*u64) u32 {
+    const resp_ptr = resp orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const ptr_slot = out_body_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const len_slot = out_body_len orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const response = @as(*HttpResponse, @ptrCast(@alignCast(resp_ptr)));
+    ptr_slot.* = response.body.ptr;
+    len_slot.* = response.body.len;
+    return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 
 pub export fn sa_http_client_resp_body_reader(resp: ?*anyopaque, out_reader: ?*?*anyopaque) u32 {

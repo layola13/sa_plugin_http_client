@@ -1,0 +1,36 @@
+{
+  "schema": "sa.plugin/1",
+  "name": "http-client",
+  "version": "0.1.0",
+  "source": {
+    "type": "local",
+    "path": "."
+  },
+  "abi": {
+    "plugin": 1,
+    "saasm": ">=0.4.0"
+  },
+  "artifacts": {
+    "linux-x86_64": {
+      "path": "zig-out/lib/libhttp-client.so"
+    }
+  },
+  "interfaces": {},
+  "skills": ["http.client"],
+  "permissions": {
+    "fs": [],
+    "net": [
+      { "url": "https://*", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://localhost", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+      { "url": "http://127.0.0.1", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] }
+    ],
+    "env": [],
+    "process": { "spawn": false, "exec": [] }
+  },
+  "dependencies": {
+    "node": {
+      "version": ">=0.1.0",
+      "abi": 1
+    }
+  }
+}
