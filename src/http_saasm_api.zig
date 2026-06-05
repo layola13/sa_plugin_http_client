@@ -199,15 +199,7 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
 
     var body = std.ArrayList(u8).init(req.allocator);
     errdefer body.deinit();
-    var buf: [1024]u8 = undefined;
-    while (true) {
-        const n = request.read(&buf) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        try body.appendSlice(buf[0..n]);
-    }
+    try request.reader().readAllArrayList(&body, 16 * 1024 * 1024);
     const headers = try cloneResponseHeaders(req.allocator, request.response);
     errdefer {
         for (headers) |header| {
@@ -374,4 +366,318 @@ pub export fn sa_http_client_req_free(req: ?*anyopaque) u32 {
     const request = @as(*HttpRequest, @ptrCast(@alignCast(value)));
     request.deinit();
     return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+const WebSocketOpcode = enum(u8) {
+    continuation = 0,
+    text = 1,
+    binary = 2,
+    connection_close = 8,
+    ping = 9,
+    pong = 10,
+};
+
+const WebSocketHandle = struct {
+    allocator: std.mem.Allocator,
+    stream: ?std.net.Stream = null,
+
+    fn isClient(self: *WebSocketHandle) bool {
+        _ = self;
+        return true;
+    }
+
+    fn readExact(self: *WebSocketHandle, buffer: []u8) bool {
+        const stream = self.stream orelse return false;
+        var index: usize = 0;
+        while (index < buffer.len) {
+            const read_n = stream.read(buffer[index..]) catch return false;
+            if (read_n == 0) return false;
+            index += read_n;
+        }
+        return true;
+    }
+
+    fn writeExact(self: *WebSocketHandle, bytes: []const u8) bool {
+        const stream = self.stream orelse return false;
+        stream.writeAll(bytes) catch return false;
+        return true;
+    }
+
+    fn deinit(self: *WebSocketHandle) void {
+        if (self.stream) |stream| {
+            stream.close();
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+fn websocketResponseHeader(response: *std.http.Client.Response, key: []const u8) ?[]const u8 {
+    var it = response.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, key)) return header.value;
+    }
+    return null;
+}
+
+fn websocketHeaderContainsToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, value, " \t,");
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(part, token)) return true;
+    }
+    return false;
+}
+
+fn websocketComputeAccept(key: []const u8, out: *[28]u8) []const u8 {
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    sha1.update(key);
+    sha1.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    sha1.final(&digest);
+    return std.base64.standard.Encoder.encode(out, &digest);
+}
+
+fn websocketMaskInPlace(bytes: []u8, mask: [4]u8) void {
+    for (bytes, 0..) |*byte, index| {
+        byte.* ^= mask[index & 3];
+    }
+}
+
+fn websocketWriteFrame(handle: *WebSocketHandle, opcode: u8, payload: []const u8) bool {
+    const masked = handle.isClient();
+    var header: [14]u8 = undefined;
+    header[0] = 0x80 | (opcode & 0x0f);
+    var header_len: usize = 2;
+    var mask_key: [4]u8 = undefined;
+    const payload_len = payload.len;
+
+    if (payload_len <= 125) {
+        header[1] = (if (masked) @as(u8, 0x80) else 0) | @as(u8, @intCast(payload_len));
+    } else if (payload_len <= 0xffff) {
+        header[1] = (if (masked) @as(u8, 0x80) else 0) | 126;
+        std.mem.writeInt(u16, header[2..4], @as(u16, @intCast(payload_len)), .big);
+        header_len = 4;
+    } else {
+        header[1] = (if (masked) @as(u8, 0x80) else 0) | 127;
+        std.mem.writeInt(u64, header[2..10], @as(u64, payload_len), .big);
+        header_len = 10;
+    }
+
+    if (!handle.writeExact(header[0..header_len])) return false;
+
+    if (masked) {
+        std.crypto.random.bytes(&mask_key);
+        if (!handle.writeExact(&mask_key)) return false;
+
+        if (payload_len > 0) {
+            const masked_payload = handle.allocator.alloc(u8, payload_len) catch return false;
+            defer handle.allocator.free(masked_payload);
+            @memcpy(masked_payload, payload);
+            websocketMaskInPlace(masked_payload, mask_key);
+            return handle.writeExact(masked_payload);
+        }
+        return true;
+    }
+
+    if (payload_len > 0) return handle.writeExact(payload);
+    return true;
+}
+
+fn websocketSendPingPong(handle: *WebSocketHandle, opcode: u8, payload: []const u8) bool {
+    return websocketWriteFrame(handle, opcode, payload);
+}
+
+
+fn fail() u32 {
+    return @intFromEnum(plugin_api.AbiStatus.failed);
+}
+fn websocketReadFrame(handle: *WebSocketHandle, max_len: u64, out_opcode: ?*u8, out_ptr: ?*?[*]const u8, out_len: ?*u64) u32 {
+    const opcode_slot = out_opcode orelse return fail();
+    const ptr_slot = out_ptr orelse return fail();
+    const len_slot = out_len orelse return fail();
+
+    while (true) {
+        var header: [2]u8 = undefined;
+        if (!handle.readExact(&header)) return fail();
+
+        const fin = (header[0] & 0x80) != 0;
+        const rsv = header[0] & 0x70;
+        const opcode = header[0] & 0x0f;
+        const masked = (header[1] & 0x80) != 0;
+
+        if (rsv != 0 or !fin) return fail();
+
+        if (handle.isClient()) {
+            if (masked) return fail();
+        } else {
+            if (!masked) return fail();
+        }
+
+        var payload_len: u64 = @as(u64, header[1] & 0x7f);
+        if (payload_len == 126) {
+            var extended: [2]u8 = undefined;
+            if (!handle.readExact(&extended)) return fail();
+            payload_len = std.mem.readInt(u16, &extended, .big);
+        } else if (payload_len == 127) {
+            var extended: [8]u8 = undefined;
+            if (!handle.readExact(&extended)) return fail();
+            payload_len = std.mem.readInt(u64, &extended, .big);
+        }
+
+        if (payload_len > max_len) return fail();
+        if (payload_len > std.math.maxInt(usize)) return fail();
+
+        var mask_key: [4]u8 = undefined;
+        if (!handle.isClient()) {
+            if (!handle.readExact(&mask_key)) return fail();
+        }
+
+        var payload: []u8 = &.{};
+        if (payload_len > 0) {
+            payload = handle.allocator.alloc(u8, @intCast(payload_len)) catch return fail();
+            errdefer handle.allocator.free(payload);
+            if (!handle.readExact(payload)) return fail();
+            if (!handle.isClient()) websocketMaskInPlace(payload, mask_key);
+        }
+
+        switch (opcode) {
+            @intFromEnum(WebSocketOpcode.ping) => {
+                if (!websocketSendPingPong(handle, @intFromEnum(WebSocketOpcode.pong), payload)) {
+                    if (payload.len > 0) handle.allocator.free(payload);
+                    return fail();
+                }
+                if (payload.len > 0) handle.allocator.free(payload);
+                continue;
+            },
+            @intFromEnum(WebSocketOpcode.pong) => {
+                if (payload.len > 0) handle.allocator.free(payload);
+                continue;
+            },
+            @intFromEnum(WebSocketOpcode.connection_close), @intFromEnum(WebSocketOpcode.text), @intFromEnum(WebSocketOpcode.binary) => {
+                opcode_slot.* = opcode;
+                if (payload.len == 0) {
+                    ptr_slot.* = null;
+                    len_slot.* = 0;
+                } else {
+                    ptr_slot.* = payload.ptr;
+                    len_slot.* = payload.len;
+                }
+                return 0;
+            },
+            else => {
+                if (payload.len > 0) handle.allocator.free(payload);
+                return fail();
+            },
+        }
+    }
+}
+
+pub export fn sa_http_websocket_read(ws: ?*anyopaque, max_len: u64, out_opcode: ?*u8, out_ptr: ?*?[*]const u8, out_len: ?*u64) u32 {
+    const value = ws orelse return fail();
+    const handle = @as(*WebSocketHandle, @ptrCast(@alignCast(value)));
+    return websocketReadFrame(handle, max_len, out_opcode, out_ptr, out_len);
+}
+
+pub export fn sa_http_websocket_write(ws: ?*anyopaque, opcode: u8, data_ptr: ?[*]const u8, data_len: u64) u32 {
+    const value = ws orelse return fail();
+    const handle = @as(*WebSocketHandle, @ptrCast(@alignCast(value)));
+    const payload = if (data_ptr) |ptr| ptr[0..@intCast(data_len)] else &[_]u8{};
+    if (!websocketWriteFrame(handle, opcode, payload)) return fail();
+    return 0;
+}
+
+pub export fn sa_http_websocket_free(ws: ?*anyopaque) u32 {
+    const value = ws orelse return fail();
+    const handle = @as(*WebSocketHandle, @ptrCast(@alignCast(value)));
+    handle.deinit();
+    return 0;
+}
+
+pub export fn sa_http_client_websocket_connect(client: ?*anyopaque, url_ptr: ?[*]const u8, url_len: u64, out_ws: ?*?*anyopaque) u32 {
+    const client_ptr = client orelse return fail();
+    const url = url_ptr orelse return fail();
+    const slot = out_ws orelse return fail();
+    const cli = @as(*HttpClient, @ptrCast(@alignCast(client_ptr)));
+    const url_slice = url[0..@intCast(url_len)];
+    const uri = std.Uri.parse(url_slice) catch return fail();
+
+    var request_headers: [3]std.http.Header = .{
+        .{ .name = "upgrade", .value = "websocket" },
+        .{ .name = "sec-websocket-version", .value = "13" },
+        undefined,
+    };
+
+    var key_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&key_bytes);
+    var key_b64: [24]u8 = undefined;
+    const key = std.base64.standard.Encoder.encode(&key_b64, &key_bytes);
+    request_headers[2] = .{ .name = "sec-websocket-key", .value = key };
+
+    var header_buf: [16 * 1024]u8 = undefined;
+    var req = cli.client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .headers = .{
+            .connection = .{ .override = "Upgrade" },
+            .user_agent = .omit,
+            .accept_encoding = .omit,
+        },
+        .extra_headers = &request_headers,
+        .keep_alive = true,
+    }) catch return fail();
+    defer req.deinit();
+
+    req.transfer_encoding = .none;
+    req.send() catch return fail();
+    req.finish() catch return fail();
+    req.wait() catch return fail();
+
+    if (req.response.status != .switching_protocols) {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    }
+
+    const upgrade = websocketResponseHeader(&req.response, "upgrade") orelse {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    };
+    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    }
+
+    const connection_value = websocketResponseHeader(&req.response, "connection") orelse {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    };
+    if (!websocketHeaderContainsToken(connection_value, "upgrade")) {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    }
+
+    const accept_value = websocketResponseHeader(&req.response, "sec-websocket-accept") orelse {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    };
+    var expected_accept_buf: [28]u8 = undefined;
+    const expected_accept = websocketComputeAccept(key, &expected_accept_buf);
+    if (!std.mem.eql(u8, accept_value, expected_accept)) {
+        if (req.connection) |connection| connection.closing = true;
+        return fail();
+    }
+
+    const connection = req.connection orelse {
+        return fail();
+    };
+    const duplicated_handle = std.posix.dup(connection.stream.handle) catch return fail();
+    const duplicated_stream = std.net.Stream{ .handle = duplicated_handle };
+
+    const handle = cli.allocator.create(WebSocketHandle) catch return fail();
+    req.connection = null;
+    req.deinit();
+
+    handle.* = .{
+        .allocator = cli.allocator,
+        .stream = duplicated_stream,
+    };
+    slot.* = @ptrCast(handle);
+    return 0;
 }
