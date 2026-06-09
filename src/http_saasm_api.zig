@@ -90,19 +90,55 @@ pub const HttpRequest = struct {
             .headers = std.ArrayList(std.http.Header).init(client.allocator),
         };
         errdefer client.allocator.free(self.url);
-        try self.headers.appendSlice(cfg.headers);
+        errdefer self.headers.deinit();
+        for (cfg.headers) |header| {
+            const name = try client.allocator.dupe(u8, header.name);
+            errdefer client.allocator.free(name);
+            const value = try client.allocator.dupe(u8, header.value);
+            errdefer client.allocator.free(value);
+            try self.headers.append(.{ .name = name, .value = value });
+        }
         self.body = if (cfg.body) |body| try client.allocator.dupe(u8, body) else null;
         errdefer if (self.body) |body| client.allocator.free(body);
         return self;
     }
 
     fn deinit(self: *HttpRequest) void {
+        for (self.headers.items) |header| {
+            self.allocator.free(header.name);
+            self.allocator.free(header.value);
+        }
         if (self.body) |body| self.allocator.free(body);
         self.allocator.free(self.url);
         self.headers.deinit();
         self.client.allocator.destroy(self);
     }
 };
+
+fn cloneRequestForAsync(src: *HttpRequest) !*HttpRequest {
+    const allocator = src.allocator;
+    const cloned = try allocator.create(HttpRequest);
+    errdefer allocator.destroy(cloned);
+    cloned.* = .{
+        .allocator = allocator,
+        .client = src.client,
+        .method = src.method,
+        .url = try allocator.dupe(u8, src.url),
+        .headers = std.ArrayList(std.http.Header).init(allocator),
+    };
+    errdefer allocator.free(cloned.url);
+    errdefer cloned.headers.deinit();
+
+    for (src.headers.items) |header| {
+        const name = try allocator.dupe(u8, header.name);
+        errdefer allocator.free(name);
+        const value = try allocator.dupe(u8, header.value);
+        errdefer allocator.free(value);
+        try cloned.headers.append(.{ .name = name, .value = value });
+    }
+    cloned.body = if (src.body) |body| try allocator.dupe(u8, body) else null;
+    return cloned;
+}
 
 pub const HttpResponse = struct {
     allocator: std.mem.Allocator,
@@ -140,6 +176,58 @@ pub const HttpBodyReader = struct {
     }
 
     fn deinit(self: *HttpBodyReader) void {
+        self.allocator.destroy(self);
+    }
+};
+
+pub const HttpRequestAsyncOp = struct {
+    allocator: std.mem.Allocator,
+    request: *HttpRequest,
+    thread: ?std.Thread = null,
+    mutex: std.Thread.Mutex = .{},
+    done: bool = false,
+    response: ?*HttpResponse = null,
+
+    fn init(request: *HttpRequest) !*HttpRequestAsyncOp {
+        const cloned_request = try cloneRequestForAsync(request);
+        errdefer cloned_request.deinit();
+        const self = try cloned_request.allocator.create(HttpRequestAsyncOp);
+        errdefer cloned_request.allocator.destroy(self);
+        self.* = .{
+            .allocator = cloned_request.allocator,
+            .request = cloned_request,
+        };
+        self.thread = try std.Thread.spawn(.{}, HttpRequestAsyncOp.run, .{self});
+        return self;
+    }
+
+    fn run(self: *HttpRequestAsyncOp) void {
+        const response = httpRequestExec(self.request) catch null;
+        self.mutex.lock();
+        self.response = response;
+        self.done = true;
+        self.mutex.unlock();
+    }
+
+    fn poll(self: *HttpRequestAsyncOp) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.done;
+    }
+
+    fn takeResponse(self: *HttpRequestAsyncOp) ?*HttpResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.done) return null;
+        const response = self.response orelse return null;
+        self.response = null;
+        return response;
+    }
+
+    fn deinit(self: *HttpRequestAsyncOp) void {
+        if (self.thread) |thread| thread.join();
+        if (self.response) |response| response.deinit();
+        self.request.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -278,6 +366,39 @@ pub export fn sa_http_client_req_send(req: ?*anyopaque, out_resp: ?*?*anyopaque)
     const request = @as(*HttpRequest, @ptrCast(@alignCast(req_ptr)));
     const response = httpRequestExec(request) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     slot.* = @ptrCast(response);
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_req_send_async(req: ?*anyopaque, out_op: ?*?*anyopaque) u32 {
+    const req_ptr = req orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const slot = out_op orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const request = @as(*HttpRequest, @ptrCast(@alignCast(req_ptr)));
+    const op = HttpRequestAsyncOp.init(request) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    slot.* = @ptrCast(op);
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_async_poll(op: ?*anyopaque, out_ready: ?*u8) u32 {
+    const op_ptr = op orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const ready_slot = out_ready orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const async_op = @as(*HttpRequestAsyncOp, @ptrCast(@alignCast(op_ptr)));
+    ready_slot.* = if (async_op.poll()) 1 else 0;
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_async_take_response(op: ?*anyopaque, out_resp: ?*?*anyopaque) u32 {
+    const op_ptr = op orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const slot = out_resp orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const async_op = @as(*HttpRequestAsyncOp, @ptrCast(@alignCast(op_ptr)));
+    const response = async_op.takeResponse() orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    slot.* = @ptrCast(response);
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_async_free(op: ?*anyopaque) u32 {
+    const value = op orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const async_op = @as(*HttpRequestAsyncOp, @ptrCast(@alignCast(value)));
+    async_op.deinit();
     return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 
@@ -485,7 +606,6 @@ fn websocketWriteFrame(handle: *WebSocketHandle, opcode: u8, payload: []const u8
 fn websocketSendPingPong(handle: *WebSocketHandle, opcode: u8, payload: []const u8) bool {
     return websocketWriteFrame(handle, opcode, payload);
 }
-
 
 fn fail() u32 {
     return @intFromEnum(plugin_api.AbiStatus.failed);
