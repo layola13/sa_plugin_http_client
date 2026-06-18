@@ -35,11 +35,5 @@
     "env": ["HOME", "TMPDIR", "TMP", "TEMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SA_*"],
     "process": { "spawn": false, "exec": [] }
   },
-  "dependencies": {
-    "node": {
-      "version": ">=0.1.0",
-      "abi": 1,
-      "path": "../sa_plugin_node"
-    }
-  }
+  "dependencies": {}
 }

@@ -266,6 +266,9 @@ fn writeHttpClientCliError(writer: std.io.AnyWriter, argv: []const []const u8, e
 
 pub fn runHttpClientCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*:0]const u8, argv_len: usize, stdout: plugin_api.HostStream, stderr: plugin_api.HostStream, out_code: *u8) callconv(.c) u32 {
     out_code.* = 0;
+    if (argv_len < 2) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
+    if (!std.mem.eql(u8, std.mem.span(argv[1]), "http-client")) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
+
     const args = plugin_helpers.cArgvToSlice(argv, argv_len, ctx.allocator) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     defer ctx.allocator.free(args);
 
