@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sci_root = b.option([]const u8, "sci-root", "Path to the sci checkout") orelse "../../sci";
+    const sa_net_primitives = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ sci_root, "src", "runtime", "sa_net_primitives.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
     const plugin_api = b.createModule(.{
         .root_source_file = b.path("src/plugin_api.zig"),
         .target = target,
@@ -15,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_module.addImport("plugin_api", plugin_api);
+    root_module.addImport("sa_net_primitives", sa_net_primitives);
     const lib = b.addLibrary(.{
         .name = "http-client",
         .root_module = root_module,
