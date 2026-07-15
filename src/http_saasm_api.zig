@@ -116,6 +116,69 @@ pub const HttpRequest = struct {
     }
 };
 
+fn requestUrlOriginLen(target: []const u8) usize {
+    var authority_start: usize = 0;
+    var scan: usize = 0;
+    while (scan + 2 < target.len) : (scan += 1) {
+        if (target[scan] == ':' and target[scan + 1] == '/' and target[scan + 2] == '/') {
+            authority_start = scan + 3;
+            break;
+        }
+    }
+    var i = authority_start;
+    while (i < target.len) : (i += 1) {
+        switch (target[i]) {
+            '/', '?', '#' => return i,
+            else => {},
+        }
+    }
+    return target.len;
+}
+
+fn targetBasePath(target: []const u8) []const u8 {
+    const start = requestUrlOriginLen(target);
+    if (start >= target.len or target[start] != '/') return "";
+    var end = start;
+    while (end < target.len and target[end] != '?' and target[end] != '#') : (end += 1) {}
+    while (end > start and target[end - 1] == '/') end -= 1;
+    if (end <= start) return "";
+    return target[start..end];
+}
+
+fn requestPathWithoutLeadingSlashes(request_path: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < request_path.len and request_path[start] == '/') : (start += 1) {}
+    return request_path[start..];
+}
+
+fn buildUpstreamUrl(allocator: std.mem.Allocator, target: []const u8, request_path: []const u8, preserve_base_path: bool) ![]u8 {
+    const origin = target[0..requestUrlOriginLen(target)];
+    if (!preserve_base_path) {
+        if (request_path.len > 0 and request_path[0] == '/') {
+            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, request_path });
+        }
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ origin, request_path });
+    }
+
+    const base_path = targetBasePath(target);
+    var relative_path = requestPathWithoutLeadingSlashes(request_path);
+    if (std.mem.endsWith(u8, base_path, "/v1") and std.mem.startsWith(u8, relative_path, "v1/")) {
+        relative_path = relative_path["v1/".len..];
+    }
+    if (relative_path.len == 0) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, base_path });
+    }
+    return try std.fmt.allocPrint(allocator, "{s}{s}/{s}", .{ origin, base_path, relative_path });
+}
+
+fn addRequestHeader(request: *HttpRequest, key: []const u8, val: []const u8) !void {
+    const name = try request.allocator.dupe(u8, key);
+    errdefer request.allocator.free(name);
+    const value = try request.allocator.dupe(u8, val);
+    errdefer request.allocator.free(value);
+    try request.headers.append(.{ .name = name, .value = value });
+}
+
 fn cloneRequestForAsync(src: *HttpRequest) !*HttpRequest {
     const allocator = src.allocator;
     const cloned = try allocator.create(HttpRequest);
@@ -332,23 +395,55 @@ pub export fn sa_http_client_req_new(client: ?*anyopaque, method: u8, url_ptr: ?
     return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 
+pub export fn sa_http_client_req_new_joined(
+    client: ?*anyopaque,
+    method: u8,
+    target_ptr: ?[*]const u8,
+    target_len: u64,
+    path_ptr: ?[*]const u8,
+    path_len: u64,
+    preserve_base_path: u8,
+    out_req: ?*?*anyopaque,
+) u32 {
+    const client_ptr = client orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const target = target_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const path = path_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const slot = out_req orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const cli = @as(*HttpClient, @ptrCast(@alignCast(client_ptr)));
+    const url = buildUpstreamUrl(
+        cli.allocator,
+        target[0..@intCast(target_len)],
+        path[0..@intCast(path_len)],
+        preserve_base_path != 0,
+    ) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    defer cli.allocator.free(url);
+    const request = HttpRequest.init(cli, .{
+        .method = @enumFromInt(method),
+        .url = url,
+    }) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    slot.* = @ptrCast(request);
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
 pub export fn sa_http_client_req_add_header(req: ?*anyopaque, key_ptr: ?[*]const u8, key_len: u64, val_ptr: ?[*]const u8, val_len: u64) u32 {
     const req_ptr = req orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     const key = key_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     const val = val_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     const request = @as(*HttpRequest, @ptrCast(@alignCast(req_ptr)));
-    const name = request.allocator.dupe(u8, key[0..@intCast(key_len)]) catch return @intFromEnum(plugin_api.AbiStatus.failed);
-    errdefer request.allocator.free(name);
-    const value = request.allocator.dupe(u8, val[0..@intCast(val_len)]) catch {
-        request.allocator.free(name);
-        return @intFromEnum(plugin_api.AbiStatus.failed);
-    };
-    errdefer request.allocator.free(value);
-    request.headers.append(.{ .name = name, .value = value }) catch {
-        request.allocator.free(name);
-        request.allocator.free(value);
-        return @intFromEnum(plugin_api.AbiStatus.failed);
-    };
+    addRequestHeader(request, key[0..@intCast(key_len)], val[0..@intCast(val_len)]) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_req_add_openai_auth(req: ?*anyopaque, key_ptr: ?[*]const u8, key_len: u64) u32 {
+    const req_ptr = req orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const key = key_ptr orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const request = @as(*HttpRequest, @ptrCast(@alignCast(req_ptr)));
+    const api_key = key[0..@intCast(key_len)];
+    if (api_key.len == 0) return @intFromEnum(plugin_api.AbiStatus.ok);
+    const bearer = std.fmt.allocPrint(request.allocator, "Bearer {s}", .{api_key}) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    defer request.allocator.free(bearer);
+    addRequestHeader(request, "authorization", bearer) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    addRequestHeader(request, "x-api-key", api_key) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 
@@ -433,6 +528,18 @@ pub export fn sa_http_client_resp_body_slice(resp: ?*anyopaque, out_body_ptr: ?*
     ptr_slot.* = response.body.ptr;
     len_slot.* = response.body.len;
     return @intFromEnum(plugin_api.AbiStatus.ok);
+}
+
+pub export fn sa_http_client_resp_body_ptr(resp: ?*anyopaque) ?[*]const u8 {
+    const response = resp orelse return null;
+    const value = @as(*HttpResponse, @ptrCast(@alignCast(response)));
+    if (value.body.len == 0) return null;
+    return value.body.ptr;
+}
+
+pub export fn sa_http_client_resp_body_len(resp: ?*anyopaque) u64 {
+    const response = resp orelse return 0;
+    return @as(*HttpResponse, @ptrCast(@alignCast(response))).body.len;
 }
 
 pub export fn sa_http_client_resp_body_reader(resp: ?*anyopaque, out_reader: ?*?*anyopaque) u32 {

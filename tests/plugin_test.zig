@@ -182,9 +182,78 @@ test "http client saasm api exposes response headers" {
     var body_len: u64 = 0;
     try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
     try std.testing.expectEqualStrings("{}", (body_ptr orelse return error.NullBody)[0..@intCast(body_len)]);
+    try std.testing.expectEqual(@as(u64, 2), plugin.sa_http_client_resp_body_len(resp));
+    const direct_body_ptr = plugin.sa_http_client_resp_body_ptr(resp) orelse return error.NullBody;
+    try std.testing.expectEqualStrings("{}", direct_body_ptr[0..@intCast(plugin.sa_http_client_resp_body_len(resp))]);
 
     thread.join();
     try std.testing.expect(done_flag.*);
+}
+
+test "http client saasm api builds joined upstream URL and OpenAI auth headers" {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try std.testing.allocator.create(std.net.Server);
+    server.* = try address.listen(.{ .reuse_address = true });
+    defer std.testing.allocator.destroy(server);
+
+    const target_seen = try std.testing.allocator.create(bool);
+    target_seen.* = false;
+    defer std.testing.allocator.destroy(target_seen);
+    const auth_seen = try std.testing.allocator.create(bool);
+    auth_seen.* = false;
+    defer std.testing.allocator.destroy(auth_seen);
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(listen_server: *std.net.Server, saw_target: *bool, saw_auth: *bool) void {
+            defer listen_server.deinit();
+            var conn = listen_server.accept() catch return;
+            defer conn.stream.close();
+
+            var request_buffer: [4096]u8 = undefined;
+            var http_server = std.http.Server.init(conn, &request_buffer);
+            var request = http_server.receiveHead() catch return;
+            saw_target.* = std.mem.eql(u8, request.head.target, "/openai/v1/models");
+
+            var saw_authorization = false;
+            var saw_x_api_key = false;
+            var it = request.iterateHeaders();
+            while (it.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "authorization") and std.mem.eql(u8, header.value, "Bearer sk-test")) {
+                    saw_authorization = true;
+                }
+                if (std.ascii.eqlIgnoreCase(header.name, "x-api-key") and std.mem.eql(u8, header.value, "sk-test")) {
+                    saw_x_api_key = true;
+                }
+            }
+            saw_auth.* = saw_authorization and saw_x_api_key;
+            conn.stream.writeAll(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+            ) catch return;
+        }
+    }.run, .{ server, target_seen, auth_seen });
+
+    var client: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_new(0, &client));
+    defer _ = plugin.sa_http_client_free(client);
+
+    const target = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/openai/v1", .{server.listen_address.getPort()});
+    defer std.testing.allocator.free(target);
+    const path = "/v1/models";
+    var req: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_new_joined(client, 1, target.ptr, target.len, path.ptr, path.len, 1, &req));
+    defer _ = plugin.sa_http_client_req_free(req);
+
+    const api_key = "sk-test";
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_add_openai_auth(req, api_key.ptr, api_key.len));
+
+    var resp: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_send(req, &resp));
+    defer _ = plugin.sa_http_client_resp_free(resp);
+    try std.testing.expectEqual(@as(u16, 200), plugin.sa_http_client_resp_status(resp));
+
+    thread.join();
+    try std.testing.expect(target_seen.*);
+    try std.testing.expect(auth_seen.*);
 }
 
 test "http client saasm async request poll and take response" {
