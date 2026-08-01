@@ -2,6 +2,7 @@ const std = @import("std");
 const plugin_api = @import("plugin_api");
 const plugin_helpers = @import("plugin_helpers.zig");
 pub usingnamespace @import("http_saasm_api.zig");
+pub usingnamespace @import("http_v2_api.zig");
 
 const skills = [_]plugin_api.SkillSection{
     .{
@@ -17,6 +18,9 @@ const skills = [_]plugin_api.SkillSection{
             "loopback GET and body retrieval",
             "chunked SSE body streaming",
             "custom CA bundle loading",
+            "v2 request deadlines, response limits, and async cancellation",
+            "TCP, TLS, and Unix-domain WebSocket transports",
+            "pollable WebSocket reads and writes with stable network statuses",
             "runtime descriptor and skills metadata",
         },
     },

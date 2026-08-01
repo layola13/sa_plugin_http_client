@@ -39,8 +39,10 @@ pub const HttpRequestConfig = struct {
 pub const HttpClient = struct {
     allocator: std.mem.Allocator,
     client: std.http.Client,
+    lifetime_mutex: std.Thread.Mutex = .{},
+    reference_count: usize = 1,
 
-    fn init(allocator: std.mem.Allocator, cfg: HttpClientConfig) !*HttpClient {
+    pub fn init(allocator: std.mem.Allocator, cfg: HttpClientConfig) !*HttpClient {
         const self = try allocator.create(HttpClient);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -61,7 +63,20 @@ pub const HttpClient = struct {
         }
     }
 
-    fn deinit(self: *HttpClient) void {
+    pub fn retain(self: *HttpClient) void {
+        self.lifetime_mutex.lock();
+        defer self.lifetime_mutex.unlock();
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count += 1;
+    }
+
+    pub fn release(self: *HttpClient) void {
+        self.lifetime_mutex.lock();
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count -= 1;
+        const destroy = self.reference_count == 0;
+        self.lifetime_mutex.unlock();
+        if (!destroy) return;
         self.client.deinit();
         self.allocator.destroy(self);
     }
@@ -74,8 +89,11 @@ pub const HttpRequest = struct {
     url: []const u8,
     body: ?[]const u8 = null,
     headers: std.ArrayList(std.http.Header),
+    timeout_ms: u32 = 0,
+    max_response_bytes: u64 = 16 * 1024 * 1024,
+    retains_client: bool = false,
 
-    fn init(client: *HttpClient, cfg: HttpRequestConfig) !*HttpRequest {
+    pub fn init(client: *HttpClient, cfg: HttpRequestConfig) !*HttpRequest {
         const self = try client.allocator.create(HttpRequest);
         errdefer client.allocator.destroy(self);
         self.* = .{
@@ -104,7 +122,9 @@ pub const HttpRequest = struct {
         return self;
     }
 
-    fn deinit(self: *HttpRequest) void {
+    pub fn deinit(self: *HttpRequest) void {
+        const client = self.client;
+        const retains_client = self.retains_client;
         for (self.headers.items) |header| {
             self.allocator.free(header.name);
             self.allocator.free(header.value);
@@ -112,7 +132,8 @@ pub const HttpRequest = struct {
         if (self.body) |body| self.allocator.free(body);
         self.allocator.free(self.url);
         self.headers.deinit();
-        self.client.allocator.destroy(self);
+        client.allocator.destroy(self);
+        if (retains_client) client.release();
     }
 };
 
@@ -189,7 +210,12 @@ fn cloneRequestForAsync(src: *HttpRequest) !*HttpRequest {
         .method = src.method,
         .url = try allocator.dupe(u8, src.url),
         .headers = std.ArrayList(std.http.Header).init(allocator),
+        .timeout_ms = src.timeout_ms,
+        .max_response_bytes = src.max_response_bytes,
+        .retains_client = true,
     };
+    cloned.client.retain();
+    errdefer cloned.client.release();
     errdefer allocator.free(cloned.url);
     errdefer cloned.headers.deinit();
 
@@ -210,7 +236,7 @@ pub const HttpResponse = struct {
     headers: []std.http.Header,
     body: []u8,
 
-    fn deinit(self: *HttpResponse) void {
+    pub fn deinit(self: *HttpResponse) void {
         for (self.headers) |header| {
             self.allocator.free(header.name);
             self.allocator.free(header.value);
@@ -586,7 +612,7 @@ pub export fn sa_http_client_body_reader_free(reader: ?*anyopaque) u32 {
 pub export fn sa_http_client_free(client: ?*anyopaque) u32 {
     const value = client orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     const cli = @as(*HttpClient, @ptrCast(@alignCast(value)));
-    cli.deinit();
+    cli.release();
     return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 

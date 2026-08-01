@@ -25,6 +25,8 @@
       { "op": "metadata", "path": "$PROJECT/**" },
       { "op": "read", "path": "/etc/**" },
       { "op": "metadata", "path": "/etc/**" },
+      { "op": "read", "path": "$HOME/.codex-max/**" },
+      { "op": "metadata", "path": "$HOME/.codex-max/**" },
       { "op": "metadata", "path": "$SA_PLUGINS_HOME/**" }
     ],
     "net": [

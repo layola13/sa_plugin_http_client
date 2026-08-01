@@ -22,3 +22,37 @@
 @extern sa_http_client_body_reader_free(reader: ptr) -> u32
 @extern sa_http_client_req_free(req: ptr) -> u32
 @extern sa_http_client_free(client: ptr) -> u32
+
+// Legacy blocking WebSocket ABI. New code should use the v2 surface below.
+@extern sa_http_client_websocket_connect(client: ptr, &url: ptr, url_len: u64, &out_ws: ptr) -> u32
+@extern sa_http_websocket_read(ws: ptr, max_len: u64, &out_opcode: ptr, &out_ptr: ptr, &out_len: ptr) -> u32
+@extern sa_http_websocket_write(ws: ptr, opcode: u8, &data: ptr, data_len: u64) -> u32
+@extern sa_http_websocket_free(ws: ptr) -> u32
+
+// v2 network status values:
+//   0 ok, 1 would_block, 2 closed, 3 timeout,
+//   4 too_large, 5 invalid, 6 io_error.
+// Poll interests/events: readable=1, writable=2, closed=4.
+@extern sa_http_client_new_v2(use_tls: u8, &ca_bundle_path: ptr, ca_bundle_path_len: u64, &out_client: ptr) -> u32
+@extern sa_http_client_req_new_v2(client: ptr, method: u8, &url: ptr, url_len: u64, &out_req: ptr) -> u32
+@extern sa_http_client_req_add_header_v2(req: ptr, &key: ptr, key_len: u64, &value: ptr, value_len: u64) -> u32
+@extern sa_http_client_req_set_body_v2(req: ptr, &body: ptr, body_len: u64) -> u32
+@extern sa_http_client_req_set_timeout_v2(req: ptr, timeout_ms: u32) -> u32
+@extern sa_http_client_req_set_max_response_bytes_v2(req: ptr, max_bytes: u64) -> u32
+@extern sa_http_client_req_send_v2(req: ptr, &out_resp: ptr) -> u32
+@extern sa_http_client_req_send_async_v2(req: ptr, &out_op: ptr) -> u32
+@extern sa_http_client_async_poll_v2(op: ptr, timeout_ms: u32, &out_ready: ptr) -> u32
+@extern sa_http_client_async_take_response_v2(op: ptr, &out_resp: ptr) -> u32
+@extern sa_http_client_async_cancel_v2(op: ptr) -> u32
+@extern sa_http_client_async_free_v2(op: ptr) -> u32
+
+@extern sa_http_client_websocket_connect_v2(client: ptr, &url: ptr, url_len: u64, timeout_ms: u32, &out_ws: ptr) -> u32
+@extern sa_http_client_websocket_connect_unix_v2(client: ptr, &socket_path: ptr, socket_path_len: u64, &url: ptr, url_len: u64, timeout_ms: u32, &out_ws: ptr) -> u32
+@extern sa_http_client_req_websocket_connect_v2(req: ptr, timeout_ms: u32, &out_ws: ptr) -> u32
+@extern sa_http_client_req_websocket_connect_unix_v2(req: ptr, &socket_path: ptr, socket_path_len: u64, timeout_ms: u32, &out_ws: ptr) -> u32
+@extern sa_http_websocket_poll_v2(ws: ptr, interests: u32, timeout_ms: u32, &out_events: ptr) -> u32
+// out_ptr is borrowed from ws until the next successful read or websocket_free_v2.
+@extern sa_http_websocket_read_v2(ws: ptr, max_len: u64, &out_opcode: ptr, &out_ptr: ptr, &out_len: ptr) -> u32
+@extern sa_http_websocket_write_v2(ws: ptr, opcode: u8, &data: ptr, data_len: u64, &out_written: ptr) -> u32
+@extern sa_http_websocket_close_v2(ws: ptr, code: u16, &reason: ptr, reason_len: u64) -> u32
+@extern sa_http_websocket_free_v2(ws: ptr) -> u32
