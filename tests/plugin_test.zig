@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const plugin = @import("plugin");
 const plugin_api = @import("plugin_api");
 
@@ -894,6 +895,19 @@ test "http client v2 TCP websocket polls fragments pongs masks and closes" {
 }
 
 test "http client v2 Unix websocket uses socket endpoint and logical URL" {
+    if (comptime builtin.os.tag == .windows) {
+        var client: ?*anyopaque = null;
+        try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
+        defer _ = plugin.sa_http_client_free(client);
+        const socket_path = "C:\\unsupported\\http-client.sock";
+        const logical_url = "ws://localhost/daemon?engine=official";
+        var websocket: ?*anyopaque = null;
+        try std.testing.expectEqual(
+            @intFromEnum(plugin.NetworkStatus.invalid),
+            plugin.sa_http_client_websocket_connect_unix_v2(client, socket_path.ptr, socket_path.len, logical_url.ptr, logical_url.len, 1000, &websocket),
+        );
+        return;
+    }
     var temporary = std.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     const temporary_path = try temporary.dir.realpathAlloc(std.testing.allocator, ".");

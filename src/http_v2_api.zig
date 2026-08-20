@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const legacy = @import("http_saasm_api.zig");
 const sa_std_net = @import("sa_std_net.zig");
 
@@ -752,7 +753,9 @@ fn websocketConnect(
     request_headers.append(.{ .name = "sec-websocket-key", .value = key }) catch return error.Io;
 
     var supplied_connection: ?*std.http.Client.Connection = null;
-    if (unix_socket_path) |path| {
+    if (comptime builtin.os.tag == .windows) {
+        if (unix_socket_path != null) return error.Invalid;
+    } else if (unix_socket_path) |path| {
         if (path.len == 0) return error.Invalid;
         supplied_connection = client.client.connectUnix(path) catch |err| return switch (statusFromOperationError(err, false)) {
             .invalid => error.Invalid,
