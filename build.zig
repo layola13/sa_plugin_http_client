@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const sci_root = b.option([]const u8, "sci-root", "Path to the sci checkout") orelse "../../sci";
+    const sci_root = b.option([]const u8, "sci-root", "Path to the sci checkout") orelse "../sci";
     const sa_net_primitives = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ sci_root, "src", "runtime", "sa_net_primitives.zig" })),
         .target = target,

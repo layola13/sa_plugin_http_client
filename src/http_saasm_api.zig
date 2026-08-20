@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const plugin_api = @import("plugin_api");
 const sa_std_net = @import("sa_std_net.zig");
 pub const SaHttpClientHandle = extern struct {
@@ -623,6 +624,19 @@ pub export fn sa_http_client_req_free(req: ?*anyopaque) u32 {
     return @intFromEnum(plugin_api.AbiStatus.ok);
 }
 
+
+fn duplicateSocket(handle: std.posix.socket_t) !std.posix.socket_t {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        var protocol_info: windows.ws2_32.WSAPROTOCOL_INFOW = undefined;
+        if (windows.ws2_32.WSADuplicateSocketW(handle, windows.GetCurrentProcessId(), &protocol_info) != 0) {
+            return error.Unexpected;
+        }
+        return windows.WSASocketW(protocol_info.iAddressFamily, protocol_info.iSocketType, protocol_info.iProtocol, &protocol_info, 0, 0);
+    }
+    return std.posix.dup(handle);
+}
+
 const WebSocketOpcode = enum(u8) {
     continuation = 0,
     text = 1,
@@ -845,7 +859,7 @@ pub export fn sa_http_client_websocket_connect(client: ?*anyopaque, url_ptr: ?[*
     const connection = req.connection orelse {
         return fail();
     };
-    const duplicated_handle = std.posix.dup(connection.stream.handle) catch return fail();
+    const duplicated_handle = duplicateSocket(connection.stream.handle) catch return fail();
     const duplicated_stream = std.net.Stream{ .handle = duplicated_handle };
 
     const handle = cli.allocator.create(WebSocketHandle) catch return fail();

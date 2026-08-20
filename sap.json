@@ -13,6 +13,9 @@
   "artifacts": {
     "linux-x86_64": {
       "path": "zig-out/lib/libhttp-client.so"
+    },
+    "windows-x86_64": {
+      "path": "zig-out/bin/http-client.dll"
     }
   },
   "interfaces": {

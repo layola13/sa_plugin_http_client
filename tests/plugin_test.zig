@@ -54,6 +54,10 @@ fn spawnLoopbackServer(allocator: std.mem.Allocator, body: []const u8) !struct {
             var conn = listen_server.accept() catch return;
             defer conn.stream.close();
 
+            var request_buffer: [4096]u8 = undefined;
+            var http_server = std.http.Server.init(conn, &request_buffer);
+            _ = http_server.receiveHead() catch return;
+
             var response_buf: [256]u8 = undefined;
             const response = std.fmt.bufPrint(
                 &response_buf,
@@ -107,6 +111,12 @@ test "http client plugin exports runtime descriptor and loopback GET works" {
     try std.testing.expectEqualStrings("http-client get <url>", exported.skills_ptr[0].items[0]);
 
     const loopback = try spawnLoopbackServer(std.testing.allocator, "hello from loopback");
+    var loopback_joined = false;
+    defer {
+        if (!loopback_joined) loopback.thread.join();
+        std.testing.allocator.destroy(loopback.server);
+        std.testing.allocator.destroy(loopback.done);
+    }
 
     var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
@@ -125,9 +135,8 @@ test "http client plugin exports runtime descriptor and loopback GET works" {
     try std.testing.expectEqual(@as(usize, 0), stderr_buf.items.len);
 
     loopback.thread.join();
+    loopback_joined = true;
     try std.testing.expect(loopback.done.*);
-    std.testing.allocator.destroy(loopback.server);
-    std.testing.allocator.destroy(loopback.done);
 }
 
 test "http client saasm api exposes response headers" {
