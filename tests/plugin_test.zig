@@ -509,7 +509,7 @@ test "http client plugin https ca bundle works against a local self-signed serve
     ;
     try std.fs.cwd().writeFile(.{ .sub_path = "cert.cnf", .data = cert_conf });
 
-    const gen = try std.process.Child.run(.{
+    const gen = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{
             "openssl",
@@ -531,7 +531,10 @@ test "http client plugin https ca bundle works against a local self-signed serve
             "v3_req",
         },
         .cwd = ".",
-    });
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
     defer std.testing.allocator.free(gen.stdout);
     defer std.testing.allocator.free(gen.stderr);
     switch (gen.term) {
@@ -1004,7 +1007,7 @@ test "http client v2 TLS websocket preserves TLS state after upgrade" {
         \\IP.1 = 127.0.0.1
     ;
     try temporary.dir.writeFile(.{ .sub_path = "cert.cnf", .data = certificate_config });
-    const generate = try std.process.Child.run(.{
+    const generate = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{
             "openssl",
@@ -1025,7 +1028,10 @@ test "http client v2 TLS websocket preserves TLS state after upgrade" {
             "-extensions",
             "v3_req",
         },
-    });
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
     defer std.testing.allocator.free(generate.stdout);
     defer std.testing.allocator.free(generate.stderr);
     switch (generate.term) {
