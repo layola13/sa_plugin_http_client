@@ -1,5 +1,5 @@
 const std = @import("std");
-const plugin_api = @import("plugin_api");
+const plugin_api = @import("plugin_api.zig");
 
 pub const StreamWriterCtx = struct {
     stream: plugin_api.HostStream,

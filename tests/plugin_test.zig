@@ -1,6 +1,6 @@
 const std = @import("std");
 const plugin = @import("plugin");
-const plugin_api = @import("plugin_api");
+const plugin_api = @import("plugin_api.zig");
 
 const CaptureStream = struct {
     buffer: *std.ArrayList(u8),

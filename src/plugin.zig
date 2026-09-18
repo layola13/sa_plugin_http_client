@@ -1,5 +1,5 @@
 const std = @import("std");
-const plugin_api = @import("plugin_api");
+const plugin_api = @import("plugin_api.zig");
 const plugin_helpers = @import("plugin_helpers.zig");
 pub usingnamespace @import("http_saasm_api.zig");
 pub usingnamespace @import("http_v2_api.zig");
