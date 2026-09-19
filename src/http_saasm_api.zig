@@ -752,7 +752,33 @@ fn manualHttpOverTls(
     return try makeStatusResponse(allocator, status_code, headers_slice, try body_out.toOwnedSlice());
 }
 
-fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
+/// Parse Retry-After header value in delta-seconds. Returns 0 if absent or invalid.
+fn getRetryAfterSecs(headers: []std.http.Header) u64 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
+            const v = std.mem.trim(u8, h.value, " \t");
+            if (std.fmt.parseInt(u64, v, 10)) |secs| {
+                return @min(secs, 300); // Cap at 5 minutes.
+            } else |_| {}
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/// Retryable: 429 Too Many Requests, and 5xx server errors.
+/// Other 4xx (400, 401, 403, 404, ...) are not retried.
+fn isRetryableStatus(status: u16) bool {
+    return status == 429 or (status >= 500 and status < 600);
+}
+
+/// Exponential backoff in seconds: 1, 2, 4, 8, 16 for attempts 0..4.
+fn backoffSecs(attempt: u32) u64 {
+    return @as(u64, 1) << @intCast(@min(attempt, 4));
+}
+
+/// Single attempt without retry. See httpRequestExec for the retry wrapper.
+fn httpRequestExecOnce(req: *HttpRequest) !*HttpResponse {
     const uri = try std.Uri.parse(req.url);
     req.client.request_mutex.lock();
     defer req.client.request_mutex.unlock();
@@ -824,6 +850,31 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
         req.allocator.free(headers);
     }
     return try makeStatusResponse(req.allocator, mapStatus(request.response.status), headers, try body.toOwnedSlice());
+}
+
+/// Retry wrapper: up to 5 retries (6 attempts total) on 429 / 5xx /
+/// transient network errors. Exponential backoff (1,2,4,8,16s),
+/// respecting Retry-After when present. Covers first and follow-up requests.
+fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
+    const max_retries: u32 = 5;
+    var attempt: u32 = 0;
+    while (true) {
+        const resp = httpRequestExecOnce(req) catch |err| {
+            if (attempt < max_retries) {
+                std.time.sleep(backoffSecs(attempt) * std.time.ns_per_s);
+                attempt += 1;
+                continue;
+            }
+            return err;
+        };
+        if (!isRetryableStatus(resp.status) or attempt >= max_retries) {
+            return resp;
+        }
+        const wait_secs = @max(backoffSecs(attempt), getRetryAfterSecs(resp.headers));
+        resp.deinit();
+        std.time.sleep(wait_secs * std.time.ns_per_s);
+        attempt += 1;
+    }
 }
 
 fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.ArrayList(u8) {
