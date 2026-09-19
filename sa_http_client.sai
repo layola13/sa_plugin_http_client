@@ -56,3 +56,14 @@
 @extern sa_http_websocket_write_v2(ws: ptr, opcode: u8, &data: ptr, data_len: u64, &out_written: ptr) -> u32
 @extern sa_http_websocket_close_v2(ws: ptr, code: u16, &reason: ptr, reason_len: u64) -> u32
 @extern sa_http_websocket_free_v2(ws: ptr) -> u32
+
+// SSE streaming POST (curl -N in background, poll + incremental read).
+// out_handle is an opaque stream handle.
+// sse_poll out_done: 0 = running, 1 = finished ok, 2 = finished with error.
+@extern sa_http_client_sse_post(&url: ptr, url_len: u64, &body: ptr, body_len: u64, &key: ptr, key_len: u64, &out_handle: ptr) -> u32
+@extern sa_http_client_sse_read(handle: ptr, &buf: ptr, buf_cap: u64, &out_len: ptr) -> u32
+@extern sa_http_client_sse_poll(handle: ptr, &out_done: ptr) -> u32
+@extern sa_http_client_sse_status(handle: ptr) -> u16
+@extern sa_http_client_sse_free(handle: ptr) -> u32
+@extern sa_http_client_sse_turn(&url: ptr, url_len: u64, &body: ptr, body_len: u64, &key: ptr, key_len: u64, api_mode: u64, &out_text: ptr, &out_text_len: ptr, &out_calls: ptr, &out_calls_len: ptr) -> u32
+@extern sa_http_client_sse_turn_free(&buf: ptr, len: u64) -> void

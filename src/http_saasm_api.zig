@@ -1347,3 +1347,759 @@ pub export fn sa_http_client_websocket_connect(client: ?*anyopaque, url_ptr: ?[*
     slot.* = @ptrCast(handle);
     return 0;
 }
+
+// ============ SSE streaming POST ============
+// Spawns curl in the background writing the response body to a temp file
+// as it arrives (-N/--no-buffer). The caller polls and reads incrementally.
+
+var sse_stream_counter = std.atomic.Value(u64).init(0);
+
+const SseStream = struct {
+    allocator: std.mem.Allocator,
+    child: std.process.Child,
+    body_path: []u8,
+    header_path: []u8,
+    req_body_path: []u8,
+    read_offset: u64,
+    http_status: u16,
+    finished: bool,
+    failed: bool,
+};
+
+fn sseTempPath(allocator: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    const n = sse_stream_counter.fetchAdd(1, .monotonic);
+    const pid = std.os.linux.getpid();
+    return std.fmt.allocPrint(allocator, "/tmp/scodex_sse_{d}_{d}.{s}", .{ pid, n, suffix });
+}
+
+fn sseParseStatus(header_path: []const u8) u16 {
+    const f = std.fs.cwd().openFile(header_path, .{}) catch return 0;
+    defer f.close();
+    var buf: [256]u8 = undefined;
+    const n = f.read(&buf) catch return 0;
+    // First line: "HTTP/1.1 200 OK"
+    const line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
+    const line = buf[0..line_end];
+    // Find first space, then parse the number after it.
+    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return 0;
+    const rest = std.mem.trimLeft(u8, line[sp + 1 ..], " ");
+    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return std.fmt.parseInt(u16, rest[0..sp2], 10) catch 0;
+}
+
+/// Parse Retry-After from SSE header file. Returns 0 if absent/invalid. Capped at 300s.
+fn sseParseRetryAfter(header_path: []const u8) u64 {
+    const f = std.fs.cwd().openFile(header_path, .{}) catch return 0;
+    defer f.close();
+    var buf: [4096]u8 = undefined;
+    const n = f.read(&buf) catch return 0;
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len > 12 and std.ascii.eqlIgnoreCase(trimmed[0..12], "retry-after:")) {
+            const v = std.mem.trim(u8, trimmed[12..], " \t");
+            if (std.fmt.parseInt(u64, v, 10)) |secs| {
+                return @min(secs, 300);
+            } else |_| {}
+        }
+    }
+    return 0;
+}
+
+fn sseCheckFinished(s: *SseStream) void {
+    if (s.finished) return;
+    const res = std.posix.waitpid(s.child.id, std.posix.W.NOHANG);
+    if (res.pid == 0) return; // still running
+    s.finished = true;
+    if (std.posix.W.IFEXITED(res.status)) {
+        s.failed = std.posix.W.EXITSTATUS(res.status) != 0;
+    } else {
+        s.failed = true; // signaled or stopped
+    }
+    s.http_status = sseParseStatus(s.header_path);
+}
+
+pub export fn sa_http_client_sse_post(
+    url_ptr: ?[*]const u8, url_len: u64,
+    body_ptr: ?[*]const u8, body_len: u64,
+    key_ptr: ?[*]const u8, key_len: u64,
+    out_handle: ?*?*anyopaque,
+) u32 {
+    const allocator = std.heap.page_allocator;
+    const slot = out_handle orelse return 1;
+    const url = if (url_ptr) |p| p[0..url_len] else return 1;
+
+    const body_path = sseTempPath(allocator, "body") catch return 1;
+    errdefer allocator.free(body_path);
+    const header_path = sseTempPath(allocator, "headers") catch return 1;
+    errdefer allocator.free(header_path);
+    const req_body_path = sseTempPath(allocator, "req") catch return 1;
+    errdefer allocator.free(req_body_path);
+
+    // Write request body to temp file.
+    {
+        const f = std.fs.cwd().createFile(req_body_path, .{}) catch return 1;
+        defer f.close();
+        if (body_ptr) |p| {
+            f.writeAll(p[0..body_len]) catch return 1;
+        }
+    }
+
+    var args = std.ArrayList([]const u8).init(allocator);
+    defer args.deinit();
+    args.append("curl") catch return 1;
+    args.append("-s") catch return 1;
+    args.append("-S") catch return 1;
+    args.append("-N") catch return 1; // no buffering: stream as it arrives
+    args.append("--max-time") catch return 1;
+    args.append("300") catch return 1;
+    args.append("-X") catch return 1;
+    args.append("POST") catch return 1;
+    args.append(url) catch return 1;
+    // Auth header
+    if (key_ptr) |kp| {
+        const auth = std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{kp[0..key_len]}) catch return 1;
+        defer allocator.free(auth);
+        args.append("-H") catch return 1;
+        args.append(auth) catch return 1;
+    }
+    args.append("-H") catch return 1;
+    args.append("Content-Type: application/json") catch return 1;
+    args.append("-H") catch return 1;
+    args.append("Accept: text/event-stream") catch return 1;
+    const data_arg = std.fmt.allocPrint(allocator, "@{s}", .{req_body_path}) catch return 1;
+    defer allocator.free(data_arg);
+    args.append("--data-binary") catch return 1;
+    args.append(data_arg) catch return 1;
+    args.append("-D") catch return 1;
+    args.append(header_path) catch return 1;
+    args.append("-o") catch return 1;
+    args.append(body_path) catch return 1;
+
+    var child = std.process.Child.init(args.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return 1;
+
+    const s = allocator.create(SseStream) catch {
+        _ = child.kill() catch unreachable;
+        _ = child.wait() catch {};
+        return 1;
+    };
+    s.* = .{
+        .allocator = allocator,
+        .child = child,
+        .body_path = body_path,
+        .header_path = header_path,
+        .req_body_path = req_body_path,
+        .read_offset = 0,
+        .http_status = 0,
+        .finished = false,
+        .failed = false,
+    };
+    slot.* = @ptrCast(s);
+    return 0;
+}
+
+pub export fn sa_http_client_sse_read(
+    handle: ?*anyopaque,
+    buf_ptr: ?[*]u8, buf_cap: u64,
+    out_len: ?*u64,
+) u32 {
+    const s = @as(*SseStream, @ptrCast(@alignCast(handle orelse return 1)));
+    const out = out_len orelse return 1;
+    const buf = buf_ptr orelse return 1;
+    out.* = 0;
+    if (buf_cap == 0) return 0;
+
+    const f = std.fs.cwd().openFile(s.body_path, .{}) catch return 0;
+    defer f.close();
+    const st = f.stat() catch return 0;
+    if (st.size <= s.read_offset) return 0;
+    f.seekTo(s.read_offset) catch return 0;
+    const want: usize = @intCast(@min(buf_cap, st.size - s.read_offset));
+    const n = f.read(buf[0..want]) catch return 0;
+    s.read_offset += n;
+    out.* = n;
+    return 0;
+}
+
+// out_done: 0 = running, 1 = finished ok, 2 = finished with error
+pub export fn sa_http_client_sse_poll(handle: ?*anyopaque, out_done: ?*u8) u32 {
+    const s = @as(*SseStream, @ptrCast(@alignCast(handle orelse return 1)));
+    const out = out_done orelse return 1;
+    sseCheckFinished(s);
+    // Also try to parse status from headers if not yet known.
+    if (s.http_status == 0) {
+        s.http_status = sseParseStatus(s.header_path);
+    }
+    out.* = if (!s.finished) 0 else if (s.failed) 2 else 1;
+    return 0;
+}
+
+pub export fn sa_http_client_sse_status(handle: ?*anyopaque) u16 {
+    const s = @as(*SseStream, @ptrCast(@alignCast(handle orelse return 0)));
+    if (s.http_status == 0) {
+        s.http_status = sseParseStatus(s.header_path);
+    }
+    return s.http_status;
+}
+
+pub export fn sa_http_client_sse_free(handle: ?*anyopaque) u32 {
+    const s = @as(*SseStream, @ptrCast(@alignCast(handle orelse return 1)));
+    if (!s.finished) {
+        _ = s.child.kill() catch {};
+        _ = s.child.wait() catch {};
+    }
+    std.fs.cwd().deleteFile(s.body_path) catch {};
+    std.fs.cwd().deleteFile(s.header_path) catch {};
+    std.fs.cwd().deleteFile(s.req_body_path) catch {};
+    s.allocator.free(s.body_path);
+    s.allocator.free(s.header_path);
+    s.allocator.free(s.req_body_path);
+    s.allocator.destroy(s);
+    return 0;
+}
+
+// High-level SSE turn: POST, stream, parse events, print deltas live,
+// accumulate text and tool calls. Bypasses SLA compiler limitations.
+// Returns: 0=ok (text), 1=ok (tool calls), 2=error.
+// Out params: text (ptr/len), calls_json (ptr/len, JSON array of {call_id,name,args}).
+// Caller must free returned buffers via sa_http_client_sse_turn_free.
+pub export fn sa_http_client_sse_turn(
+    url_ptr: ?[*]const u8, url_len: u64,
+    body_ptr: ?[*]const u8, body_len: u64,
+    key_ptr: ?[*]const u8, key_len: u64,
+    api_mode: u64,
+    out_text_ptr: ?*?[*]u8, out_text_len: ?*u64,
+    out_calls_ptr: ?*?[*]u8, out_calls_len: ?*u64,
+) u32 {
+    const otp = out_text_ptr orelse return 2;
+    const otl = out_text_len orelse return 2;
+    const ocp = out_calls_ptr orelse return 2;
+    const ocl = out_calls_len orelse return 2;
+    otp.* = null;
+    otl.* = 0;
+    ocp.* = null;
+    ocl.* = 0;
+
+    // Retry wrapper: up to 5 retries (6 attempts) on 429/5xx/transient network errors.
+    // Exponential backoff 1/2/4/8/16s, respecting Retry-After (capped at 5min).
+    // Once streaming starts (200 OK), no retry - mid-stream failures return error.
+    var attempt: u32 = 0;
+    while (true) {
+        var handle: ?*anyopaque = null;
+        if (sa_http_client_sse_post(url_ptr, url_len, body_ptr, body_len, key_ptr, key_len, &handle) != 0 or handle == null) {
+            if (handle) |h| _ = sa_http_client_sse_free(h);
+            if (attempt < 5) {
+                std.time.sleep(backoffSecs(attempt) * std.time.ns_per_s);
+                attempt += 1;
+                continue;
+            }
+            return 2;
+        }
+        // Wait for HTTP status.
+        var status: u16 = 0;
+        var waits: u32 = 0;
+        while (waits < 200) : (waits += 1) {
+            const st = sa_http_client_sse_status(handle);
+            if (st != 0) {
+                status = st;
+                break;
+            }
+            var done: u8 = 0;
+            _ = sa_http_client_sse_poll(handle, &done);
+            if (done != 0) break;
+            std.time.sleep(50 * std.time.ns_per_ms);
+        }
+        if (status == 200) {
+            // Success: stream to completion. sseTurnStream does not free handle;
+            // we free it here via defer.
+            defer _ = sa_http_client_sse_free(handle);
+            return sseTurnStream(handle, api_mode, otp, otl, ocp, ocl);
+        }
+        // Non-200: check if retryable.
+        const s = @as(*SseStream, @ptrCast(@alignCast(handle.?)));
+        const retry_after = sseParseRetryAfter(s.header_path);
+        _ = sa_http_client_sse_free(handle);
+        if (status != 0 and isRetryableStatus(status) and attempt < 5) {
+            const wait_secs = @max(backoffSecs(attempt), retry_after);
+            std.time.sleep(wait_secs * std.time.ns_per_s);
+            attempt += 1;
+            continue;
+        }
+        return 2;
+    }
+}
+
+/// Streaming part: assumes handle has 200 OK status. Reads SSE stream to completion.
+fn sseTurnStream(
+    handle: ?*anyopaque,
+    api_mode: u64,
+    otp: *?[*]u8, otl: *u64,
+    ocp: *?[*]u8, ocl: *u64,
+) u32 {
+    const allocator = std.heap.page_allocator;
+    const s = @as(*SseStream, @ptrCast(@alignCast(handle.?)));
+
+    var text = std.ArrayList(u8).init(allocator);
+    defer text.deinit();
+    var calls = std.ArrayList(SseCall).init(allocator);
+    defer {
+        for (calls.items) |*c| {
+            if (c.call_id.len > 0) allocator.free(c.call_id);
+            if (c.name.len > 0) allocator.free(c.name);
+            if (c.args.len > 0) allocator.free(c.args);
+            if (c.key.len > 0) allocator.free(c.key);
+        }
+        calls.deinit();
+    }
+    var active = std.ArrayList(SseCall).init(allocator);
+    defer {
+        // Free any remaining active calls.
+        for (active.items) |*ac| {
+            if (ac.call_id.len > 0) allocator.free(ac.call_id);
+            if (ac.name.len > 0) allocator.free(ac.name);
+            if (ac.args.len > 0) allocator.free(ac.args);
+            if (ac.key.len > 0) allocator.free(ac.key);
+        }
+        active.deinit();
+    }
+    var stream_done = false;
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    var processed_offset: usize = 0;
+
+    const stdout = std.io.getStdOut().writer();
+
+    // Main read loop.
+    while (!stream_done) {
+        // Read new bytes from body file.
+        const new_data = sseReadNew(s, &processed_offset) catch {
+            return 2;
+        };
+        if (new_data.len > 0) {
+            buf.appendSlice(new_data) catch return 2;
+            allocator.free(new_data);
+            // Extract complete events.
+            while (true) {
+                const delim = sseFindEventEnd(buf.items) orelse break;
+                const ev = buf.items[0..delim.pos];
+                // Parse event data.
+                if (sseParseEventData(allocator, ev)) |data| {
+                    defer if (data.owned) allocator.free(data.payload);
+                    if (data.is_done) {
+                        stream_done = true;
+                    } else if (data.payload.len > 0) {
+                        sseHandleEvent(allocator, data.payload, api_mode, &text, &calls, &active, &stream_done, stdout) catch {};
+                    }
+                }
+                // Remove processed event (+ delimiter length).
+                const remove_len = delim.pos + delim.len;
+                if (remove_len < buf.items.len) {
+                    std.mem.copyForwards(u8, buf.items[0..], buf.items[remove_len..]);
+                }
+                buf.shrinkRetainingCapacity(buf.items.len - remove_len);
+                if (stream_done) break;
+            }
+        }
+        if (stream_done) break;
+        var done: u8 = 0;
+        _ = sa_http_client_sse_poll(handle, &done);
+        if (done == 1) {
+            // Process trailing.
+            if (buf.items.len > 0) {
+                if (sseParseEventData(allocator, buf.items)) |data| {
+                    defer if (data.owned) allocator.free(data.payload);
+                    if (!data.is_done and data.payload.len > 0) {
+                        sseHandleEvent(allocator, data.payload, api_mode, &text, &calls, &active, &stream_done, stdout) catch {};
+                    }
+                }
+            }
+            break;
+        } else if (done == 2) {
+            return 2;
+        }
+        if (new_data.len == 0) {
+            std.time.sleep(20 * std.time.ns_per_ms);
+        }
+    }
+
+    // Finalize all active calls.
+    sseFinalizeActive(allocator, &active, &calls) catch return 2;
+
+    // Print newline after stream.
+    stdout.writeAll("\n") catch {};
+
+    // Build calls JSON first (so text isn't leaked on failure).
+    var calls_json = std.ArrayList(u8).init(allocator);
+    defer calls_json.deinit();
+    calls_json.appendSlice("[") catch return 2;
+    for (calls.items, 0..) |c, i| {
+        if (i > 0) calls_json.appendSlice(",") catch return 2;
+        calls_json.appendSlice("{\"call_id\":\"") catch return 2;
+        sseJsonEscape(calls_json.writer(), c.call_id) catch return 2;
+        calls_json.appendSlice("\",\"name\":\"") catch return 2;
+        sseJsonEscape(calls_json.writer(), c.name) catch return 2;
+        calls_json.appendSlice("\",\"args\":\"") catch return 2;
+        sseJsonEscape(calls_json.writer(), c.args) catch return 2;
+        calls_json.appendSlice("\"}") catch return 2;
+    }
+    calls_json.appendSlice("]") catch return 2;
+    const cj_slice = calls_json.toOwnedSlice() catch return 2;
+    errdefer allocator.free(cj_slice);
+
+    // Return text.
+    const text_slice = text.toOwnedSlice() catch {
+        allocator.free(cj_slice);
+        return 2;
+    };
+
+    // All succeeded; assign outputs.
+    otp.* = text_slice.ptr;
+    otl.* = text_slice.len;
+    ocp.* = cj_slice.ptr;
+    ocl.* = cj_slice.len;
+
+    return if (calls.items.len > 0) 1 else 0;
+}
+
+const SseCall = struct {
+    call_id: []u8,
+    name: []u8,
+    args: []u8,
+    // For lookup during streaming: responses uses call_id, chat uses index.
+    // We store the raw key string for matching.
+    key: []u8,
+};
+
+const SseEventData = struct {
+    payload: []const u8,
+    is_done: bool,
+    owned: bool, // if true, caller must free payload
+};
+
+fn sseReadNew(s: *SseStream, offset: *usize) ![]u8 {
+    const f = std.fs.cwd().openFile(s.body_path, .{}) catch |err| {
+        // File not yet created by curl; treat as no new data.
+        if (err == error.FileNotFound) {
+            return try s.allocator.alloc(u8, 0);
+        }
+        return err;
+    };
+    defer f.close();
+    const stat = try f.stat();
+    const size = stat.size;
+    if (size <= offset.*) return try s.allocator.alloc(u8, 0);
+    const len = size - offset.*;
+    var data = try s.allocator.alloc(u8, len);
+    errdefer s.allocator.free(data);
+    try f.seekTo(offset.*);
+    const n = try f.readAll(data);
+    offset.* += n;
+    // Shrink to actual bytes read so free() gets the right size.
+    if (n < len) {
+        data = try s.allocator.realloc(data, n);
+    }
+    return data;
+}
+
+const SseDelim = struct { pos: usize, len: usize };
+fn sseFindEventEnd(data: []const u8) ?SseDelim {
+    var i: usize = 0;
+    while (i + 1 < data.len) : (i += 1) {
+        if (data[i] == '\n' and data[i + 1] == '\n') return .{ .pos = i, .len = 2 };
+        // CRLF: \r\n\r\n is 4 bytes.
+        if (i + 3 < data.len and data[i] == '\r' and data[i + 1] == '\n' and data[i + 2] == '\r' and data[i + 3] == '\n') return .{ .pos = i, .len = 4 };
+    }
+    return null;
+}
+
+fn sseParseEventData(allocator: std.mem.Allocator, ev: []const u8) ?SseEventData {
+    // SSE spec: multiple "data:" lines are joined with "\n".
+    var parts = std.ArrayList([]const u8).init(allocator);
+    defer parts.deinit();
+    var is_done = false;
+    var lines = std.mem.splitScalar(u8, ev, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r");
+        if (std.mem.startsWith(u8, trimmed, "data:")) {
+            const d = std.mem.trim(u8, trimmed[5..], " ");
+            if (std.mem.eql(u8, d, "[DONE]")) {
+                is_done = true;
+            } else {
+                parts.append(d) catch return null;
+            }
+        }
+    }
+    if (is_done) return .{ .payload = "", .is_done = true, .owned = false };
+    if (parts.items.len == 0) return null;
+    if (parts.items.len == 1) {
+        return .{ .payload = parts.items[0], .is_done = false, .owned = false };
+    }
+    // Join with \n.
+    const joined = std.mem.join(allocator, "\n", parts.items) catch return null;
+    return .{ .payload = joined, .is_done = false, .owned = true };
+}
+
+fn sseHandleEvent(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    api_mode: u64,
+    text: *std.ArrayList(u8),
+    calls: *std.ArrayList(SseCall),
+    active: *std.ArrayList(SseCall),
+    stream_done: *bool,
+    stdout: anytype,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (api_mode == 0) {
+        try sseHandleResponsesEvent(allocator, root, text, calls, active, stream_done, stdout);
+    } else {
+        try sseHandleChatEvent(allocator, root, text, calls, active, stream_done, stdout);
+    }
+}
+
+// Find an active call by key (call_id for responses, index string for chat).
+fn sseFindActive(active: *std.ArrayList(SseCall), key: []const u8) ?*SseCall {
+    for (active.items) |*ac| {
+        if (std.mem.eql(u8, ac.key, key)) return ac;
+    }
+    return null;
+}
+
+// Move all active calls to the completed list (finalize).
+fn sseFinalizeActive(allocator: std.mem.Allocator, active: *std.ArrayList(SseCall), calls: *std.ArrayList(SseCall)) !void {
+    for (active.items) |*ac| {
+        if (ac.name.len > 0) {
+            try calls.append(ac.*);
+        } else {
+            if (ac.call_id.len > 0) allocator.free(ac.call_id);
+            if (ac.name.len > 0) allocator.free(ac.name);
+            if (ac.args.len > 0) allocator.free(ac.args);
+            if (ac.key.len > 0) allocator.free(ac.key);
+        }
+    }
+    active.clearRetainingCapacity();
+}
+
+fn sseJsonStr(val: std.json.Value) ?[]const u8 {
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn sseHandleResponsesEvent(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    text: *std.ArrayList(u8),
+    calls: *std.ArrayList(SseCall),
+    active: *std.ArrayList(SseCall),
+    stream_done: *bool,
+    stdout: anytype,
+) !void {
+    const obj = switch (root) { .object => |o| o, else => return };
+    const tval = obj.get("type") orelse return;
+    const tstr = sseJsonStr(tval) orelse return;
+
+    if (std.mem.eql(u8, tstr, "response.output_text.delta")) {
+        if (obj.get("delta")) |dval| {
+            if (sseJsonStr(dval)) |ds| {
+                try stdout.writeAll(ds);
+                try text.appendSlice(ds);
+            }
+        }
+    } else if (std.mem.eql(u8, tstr, "response.output_item.added")) {
+        if (obj.get("item")) |ival| {
+            const item = switch (ival) { .object => |o| o, else => return };
+            if (item.get("type")) |tyval| {
+                if (sseJsonStr(tyval)) |tys| {
+                    if (std.mem.eql(u8, tys, "function_call")) {
+                        var cid: []u8 = &.{};
+                        var nm: []u8 = &.{};
+                        if (item.get("call_id")) |cv| {
+                            if (sseJsonStr(cv)) |cs| cid = try allocator.dupe(u8, cs);
+                        }
+                        if (item.get("name")) |nv| {
+                            if (sseJsonStr(nv)) |ns| nm = try allocator.dupe(u8, ns);
+                        }
+                        // Key by call_id for delta routing.
+                        const key = try allocator.dupe(u8, cid);
+                        errdefer allocator.free(key);
+                        // If a call with same key exists, finalize it first.
+                        if (sseFindActive(active, key)) |existing| {
+                            if (existing.name.len > 0) {
+                                try calls.append(existing.*);
+                            } else {
+                                if (existing.call_id.len > 0) allocator.free(existing.call_id);
+                                if (existing.name.len > 0) allocator.free(existing.name);
+                                if (existing.args.len > 0) allocator.free(existing.args);
+                                if (existing.key.len > 0) allocator.free(existing.key);
+                            }
+                            // Remove from active.
+                            for (active.items, 0..) |*ac, idx| {
+                                if (ac == existing) {
+                                    _ = active.orderedRemove(idx);
+                                    break;
+                                }
+                            }
+                        }
+                        try active.append(.{
+                            .call_id = cid,
+                            .name = nm,
+                            .args = &.{},
+                            .key = key,
+                        });
+                    }
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, tstr, "response.function_call_arguments.delta")) {
+        // Route by item_id if present, else use most recent active.
+        var target: ?*SseCall = null;
+        if (obj.get("item_id")) |idval| {
+            if (sseJsonStr(idval)) |ids| {
+                target = sseFindActive(active, ids);
+            }
+        }
+        if (target == null and active.items.len > 0) {
+            target = &active.items[active.items.len - 1];
+        }
+        if (target) |cc| {
+            if (obj.get("delta")) |dval| {
+                if (sseJsonStr(dval)) |ds| {
+                    const old_args = cc.args;
+                    const new_args = try std.mem.concat(allocator, u8, &.{ old_args, ds });
+                    if (old_args.len > 0) allocator.free(old_args);
+                    cc.args = new_args;
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, tstr, "response.completed")) {
+        stream_done.* = true;
+    }
+}
+
+fn sseHandleChatEvent(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    text: *std.ArrayList(u8),
+    calls: *std.ArrayList(SseCall),
+    active: *std.ArrayList(SseCall),
+    stream_done: *bool,
+    stdout: anytype,
+) !void {
+    _ = stream_done;
+    const obj = switch (root) { .object => |o| o, else => return };
+    const cval = obj.get("choices") orelse return;
+    const carr = switch (cval) { .array => |a| a, else => return };
+    if (carr.items.len == 0) return;
+    const choice = switch (carr.items[0]) { .object => |o| o, else => return };
+    const dval = choice.get("delta") orelse return;
+    const delta = switch (dval) { .object => |o| o, else => return };
+
+    if (delta.get("content")) |cv| {
+        if (sseJsonStr(cv)) |cs| {
+            try stdout.writeAll(cs);
+            try text.appendSlice(cs);
+        }
+    }
+
+    if (delta.get("tool_calls")) |tcval| {
+        const tcarr = switch (tcval) { .array => |a| a, else => return };
+        for (tcarr.items) |tcitem| {
+            const tc = switch (tcitem) { .object => |o| o, else => continue };
+            // Get index for routing (default "0").
+            var idx_buf: [16]u8 = undefined;
+            var idx_str: []const u8 = "0";
+            if (tc.get("index")) |ixval| {
+                switch (ixval) {
+                    .integer => |ix| {
+                        idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{ix}) catch "0";
+                    },
+                    else => {},
+                }
+            }
+            if (tc.get("id")) |idval| {
+                if (sseJsonStr(idval)) |ids| {
+                    // New call with this index: finalize previous with same index.
+                    if (sseFindActive(active, idx_str)) |existing| {
+                        if (existing.name.len > 0) {
+                            try calls.append(existing.*);
+                        } else {
+                            if (existing.call_id.len > 0) allocator.free(existing.call_id);
+                            if (existing.name.len > 0) allocator.free(existing.name);
+                            if (existing.args.len > 0) allocator.free(existing.args);
+                            if (existing.key.len > 0) allocator.free(existing.key);
+                        }
+                        for (active.items, 0..) |*ac, i| {
+                            if (ac == existing) {
+                                _ = active.orderedRemove(i);
+                                break;
+                            }
+                        }
+                    }
+                    var nm: []u8 = &.{};
+                    var ag: []u8 = &.{};
+                    if (tc.get("function")) |fval| {
+                        const func = switch (fval) { .object => |o| o, else => null };
+                        if (func) |fo| {
+                            if (fo.get("name")) |nv| {
+                                if (sseJsonStr(nv)) |ns| nm = try allocator.dupe(u8, ns);
+                            }
+                            if (fo.get("arguments")) |av| {
+                                if (sseJsonStr(av)) |as| ag = try allocator.dupe(u8, as);
+                            }
+                        }
+                    }
+                    const key = try allocator.dupe(u8, idx_str);
+                    errdefer allocator.free(key);
+                    try active.append(.{
+                        .call_id = try allocator.dupe(u8, ids),
+                        .name = nm,
+                        .args = ag,
+                        .key = key,
+                    });
+                }
+            } else if (tc.get("function")) |fval| {
+                // Arguments delta: route by index.
+                if (sseFindActive(active, idx_str)) |cc| {
+                    const func = switch (fval) { .object => |o| o, else => continue };
+                    if (func.get("arguments")) |av| {
+                        if (sseJsonStr(av)) |as| {
+                            const old_args = cc.args;
+                            const new_args = try std.mem.concat(allocator, u8, &.{ old_args, as });
+                            if (old_args.len > 0) allocator.free(old_args);
+                            cc.args = new_args;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sseJsonEscape(writer: anytype, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(ch),
+        }
+    }
+}
+
+pub export fn sa_http_client_sse_turn_free(ptr: ?[*]u8, len: u64) void {
+    if (ptr) |p| {
+        const slice = p[0..len];
+        std.heap.page_allocator.free(slice);
+    }
+}
