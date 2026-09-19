@@ -326,13 +326,43 @@ fn executeRequestV2(request: *legacy.HttpRequest, tracker: ?*V2AsyncOp) V2Error!
     if (requestCancelled(tracker)) return error.Closed;
     const uri = std.Uri.parse(request.url) catch |err| return mapHttpError(err, deadline, tracker);
     var header_buffer: [16 * 1024]u8 = undefined;
+    // For HTTPS through a proxy, bypass Zig 0.14.1's buggy connectTunnel():
+    // build the tunnel + TLS handshake deterministically and hand the ready
+    // connection to open().
+    var manual_conn: ?*std.http.Client.Connection = null;
+    defer if (manual_conn) |c| {
+        c.stream.close();
+        request.allocator.destroy(c.tls_client);
+        request.allocator.free(c.host);
+        request.allocator.destroy(c);
+    };
+    if (std.mem.eql(u8, uri.scheme, "https") and request.client.client.https_proxy != null) {
+        const target_port = uri.port orelse 443;
+        const target_host = uri.host orelse return error.Invalid;
+        const host_str = switch (target_host) {
+            .raw => |s| s,
+            .percent_encoded => |s| s,
+        };
+        manual_conn = legacy.connectHttpsProxyTunnel(
+            &request.client.client,
+            request.allocator,
+            host_str,
+            target_port,
+        ) catch |err| {
+            manual_conn = null;
+            return mapHttpError(err, deadline, tracker);
+        };
+    }
     var http_request = request.client.client.open(request.method, uri, .{
         .server_header_buffer = &header_buffer,
         .keep_alive = false,
         .redirect_behavior = .unhandled,
         .headers = .{},
         .extra_headers = request.headers.items,
+        .connection = manual_conn,
     }) catch |err| return mapHttpError(err, deadline, tracker);
+    // open() adopted the connection.
+    manual_conn = null;
     defer http_request.deinit();
 
     const connection = http_request.connection orelse return error.Closed;

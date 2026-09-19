@@ -434,6 +434,88 @@ fn makeStatusResponse(allocator: std.mem.Allocator, status: u16, headers: []std.
     return resp;
 }
 
+/// Manually establish an HTTPS connection through an HTTP proxy.
+/// Replaces Zig 0.14.1's buggy connectTunnel() which builds the CONNECT
+/// tunnel over plain TCP but never performs the TLS handshake, leaving the
+/// stream in a racy state. This function does the full sequence
+/// deterministically: TCP -> CONNECT -> read 200 -> TLS handshake.
+/// Returns an owned *Connection with protocol=.tls, or an error.
+pub fn connectHttpsProxyTunnel(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    target_host: []const u8,
+    target_port: u16,
+) !*std.http.Client.Connection {
+    const proxy = client.https_proxy orelse return error.NoProxy;
+    // Prevent proxying through itself.
+    if (std.ascii.eqlIgnoreCase(proxy.host, target_host) and proxy.port == target_port) {
+        return error.ProxyLoop;
+    }
+
+    // 1. TCP connect to the proxy.
+    const stream = try std.net.tcpConnectToHost(allocator, proxy.host, proxy.port);
+    errdefer stream.close();
+
+    // 2. Send CONNECT request.
+    var send_buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&send_buf);
+    const w = fbs.writer();
+    try w.print("CONNECT {s}:{d} HTTP/1.1\r\n", .{ target_host, target_port });
+    try w.print("Host: {s}:{d}\r\n", .{ target_host, target_port });
+    if (proxy.authorization) |auth| {
+        try w.writeAll("Proxy-Authorization: ");
+        try w.writeAll(auth);
+        try w.writeAll("\r\n");
+    }
+    try w.writeAll("\r\n");
+    try stream.writeAll(fbs.getWritten());
+
+    // 3. Read CONNECT response. Must be 200, headers end with \r\n\r\n.
+    var resp_buf: [8192]u8 = undefined;
+    var resp_len: usize = 0;
+    while (resp_len < resp_buf.len) {
+        const n = try stream.read(resp_buf[resp_len..]);
+        if (n == 0) return error.ProxyClosedConnection;
+        resp_len += n;
+        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |_| break;
+    } else return error.ProxyResponseTooLarge;
+    // Parse status line: "HTTP/1.1 200 ..."
+    const status_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ProxyBadResponse;
+    const status_line = resp_buf[0..status_end];
+    var parts = std.mem.splitScalar(u8, status_line, ' ');
+    _ = parts.next(); // HTTP version
+    const code_str = parts.next() orelse return error.ProxyBadResponse;
+    const code = std.fmt.parseInt(u16, code_str, 10) catch return error.ProxyBadResponse;
+    if (code != 200) return error.ProxyConnectFailed;
+    // Note: any bytes after \r\n\r\n belong to the TLS handshake; but a
+    // well-behaved proxy sends exactly the headers here. We require the
+    // response to end at the header boundary for determinism.
+    const header_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n").? + 4;
+    if (header_end != resp_len) return error.ProxyUnexpectedData;
+
+    // 4. TLS handshake on the tunnelled stream.
+    const tls_client = try allocator.create(std.crypto.tls.Client);
+    errdefer allocator.destroy(tls_client);
+    tls_client.* = try std.crypto.tls.Client.init(stream, .{
+        .host = .{ .explicit = target_host },
+        .ca = .{ .bundle = client.ca_bundle },
+    });
+    tls_client.allow_truncation_attacks = true;
+
+    // 5. Build the Connection.
+    const conn = try allocator.create(std.http.Client.Connection);
+    errdefer allocator.destroy(conn);
+    conn.* = .{
+        .stream = stream,
+        .tls_client = tls_client,
+        .protocol = .tls,
+        .host = try allocator.dupe(u8, target_host),
+        .port = target_port,
+        .proxied = true,
+    };
+    return conn;
+}
+
 fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
     const uri = try std.Uri.parse(req.url);
     req.client.request_mutex.lock();
@@ -456,37 +538,48 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
         try req.headers.append(.{ .name = ae_name, .value = ae_val });
     }
     var header_buf: [16 * 1024]u8 = undefined;
+    // For HTTPS through a proxy, bypass Zig 0.14.1's buggy connectTunnel()
+    // entirely: build the tunnel + TLS handshake deterministically ourselves
+    // and hand the ready connection to open().
+    var manual_conn: ?*std.http.Client.Connection = null;
+    defer if (manual_conn) |c| {
+        // The request takes ownership via options.connection; only clean up
+        // here if open() failed before adopting it.
+        c.stream.close();
+        req.allocator.destroy(c.tls_client);
+        req.allocator.free(c.host);
+        req.allocator.destroy(c);
+    };
+    if (std.mem.eql(u8, uri.scheme, "https") and req.client.client.https_proxy != null) {
+        const target_port = uri.port orelse 443;
+        const target_host = uri.host orelse return error.InvalidUri;
+        // host may be .raw; resolve to a string slice
+        const host_str = switch (target_host) {
+            .raw => |s| s,
+            .percent_encoded => |s| s,
+        };
+        manual_conn = connectHttpsProxyTunnel(
+            &req.client.client,
+            req.allocator,
+            host_str,
+            target_port,
+        ) catch |err| {
+            manual_conn = null;
+            return err;
+        };
+    }
     var request = try req.client.client.open(req.method, uri, .{
         .server_header_buffer = &header_buf,
         .keep_alive = false,
         .headers = .{},
         .extra_headers = req.headers.items,
+        .connection = manual_conn,
     });
+    // open() adopted the connection.
+    manual_conn = null;
     defer request.deinit();
 
-    // Workaround for a Zig 0.14.1 std.http bug: connectTunnel() builds the
-    // CONNECT tunnel over plain TCP and never performs the TLS handshake, so
-    // an https:// request would go out as plaintext to port 443 and the
-    // server just closes the connection (EndOfStream in wait()). Detect the
-    // un-upgraded tunnel here and do the handshake ourselves.
-    if (std.mem.eql(u8, uri.scheme, "https")) {
-        const conn = request.connection.?;
-        if (conn.protocol == .plain) {
-            const tls_client = try req.allocator.create(std.crypto.tls.Client);
-            errdefer req.allocator.destroy(tls_client);
-            tls_client.* = try std.crypto.tls.Client.init(conn.stream, .{
-                .host = .{ .explicit = conn.host },
-                .ca = .{ .bundle = req.client.client.ca_bundle },
-            });
-            // Same as connectTcp(): appropriate for HTTPS because the HTTP
-            // headers carry the content length (truncation detection).
-            tls_client.allow_truncation_attacks = true;
-            conn.tls_client = tls_client;
-            conn.protocol = .tls;
-        }
-    }
-
-    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;
+    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;
     try request.send();
     if (req.body) |body| {
         try request.writeAll(body);
