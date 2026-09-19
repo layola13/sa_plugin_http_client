@@ -437,26 +437,33 @@ fn makeStatusResponse(allocator: std.mem.Allocator, status: u16, headers: []std.
 /// Manually establish an HTTPS connection through an HTTP proxy.
 /// Replaces Zig 0.14.1's buggy connectTunnel() which builds the CONNECT
 /// tunnel over plain TCP but never performs the TLS handshake, leaving the
-/// stream in a racy state. This function does the full sequence
-/// deterministically: TCP -> CONNECT -> read 200 -> TLS handshake.
-/// Returns an owned *Connection with protocol=.tls, or an error.
-pub fn connectHttpsProxyTunnel(
+/// Establishes a CONNECT tunnel through the HTTPS proxy and performs TLS
+/// handshake. Returns the TLS client and the underlying stream.
+/// The caller owns both and must close/destroy them.
+fn establishProxyTlsTunnel(
     client: *std.http.Client,
     allocator: std.mem.Allocator,
     target_host: []const u8,
     target_port: u16,
-) !*std.http.Client.Connection {
+) !struct { tls: *std.crypto.tls.Client, stream: std.net.Stream } {
     const proxy = client.https_proxy orelse return error.NoProxy;
-    // Prevent proxying through itself.
     if (std.ascii.eqlIgnoreCase(proxy.host, target_host) and proxy.port == target_port) {
         return error.ProxyLoop;
     }
 
-    // 1. TCP connect to the proxy.
-    const stream = try std.net.tcpConnectToHost(allocator, proxy.host, proxy.port);
+    const stream = std.net.tcpConnectToHost(allocator, proxy.host, proxy.port) catch |err| {
+        return err;
+    };
     errdefer stream.close();
 
-    // 2. Send CONNECT request.
+    // Set socket receive timeout to avoid infinite hangs (30 seconds).
+    {
+        const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
+
+    // Send CONNECT request.
     var send_buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&send_buf);
     const w = fbs.writer();
@@ -470,7 +477,7 @@ pub fn connectHttpsProxyTunnel(
     try w.writeAll("\r\n");
     try stream.writeAll(fbs.getWritten());
 
-    // 3. Read CONNECT response. Must be 200, headers end with \r\n\r\n.
+    // Read CONNECT response.
     var resp_buf: [8192]u8 = undefined;
     var resp_len: usize = 0;
     while (resp_len < resp_buf.len) {
@@ -479,21 +486,17 @@ pub fn connectHttpsProxyTunnel(
         resp_len += n;
         if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |_| break;
     } else return error.ProxyResponseTooLarge;
-    // Parse status line: "HTTP/1.1 200 ..."
     const status_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ProxyBadResponse;
     const status_line = resp_buf[0..status_end];
     var parts = std.mem.splitScalar(u8, status_line, ' ');
-    _ = parts.next(); // HTTP version
+    _ = parts.next();
     const code_str = parts.next() orelse return error.ProxyBadResponse;
     const code = std.fmt.parseInt(u16, code_str, 10) catch return error.ProxyBadResponse;
     if (code != 200) return error.ProxyConnectFailed;
-    // Note: any bytes after \r\n\r\n belong to the TLS handshake; but a
-    // well-behaved proxy sends exactly the headers here. We require the
-    // response to end at the header boundary for determinism.
     const header_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n").? + 4;
     if (header_end != resp_len) return error.ProxyUnexpectedData;
 
-    // 4. TLS handshake on the tunnelled stream.
+    // TLS handshake.
     const tls_client = try allocator.create(std.crypto.tls.Client);
     errdefer allocator.destroy(tls_client);
     tls_client.* = try std.crypto.tls.Client.init(stream, .{
@@ -502,18 +505,251 @@ pub fn connectHttpsProxyTunnel(
     });
     tls_client.allow_truncation_attacks = true;
 
-    // 5. Build the Connection.
+    return .{ .tls = tls_client, .stream = stream };
+}
+
+/// Old wrapper kept for compatibility; prefer establishProxyTlsTunnel.
+pub fn connectHttpsProxyTunnel(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    target_host: []const u8,
+    target_port: u16,
+) !*std.http.Client.Connection {
+    const t = try establishProxyTlsTunnel(client, allocator, target_host, target_port);
     const conn = try allocator.create(std.http.Client.Connection);
     errdefer allocator.destroy(conn);
     conn.* = .{
-        .stream = stream,
-        .tls_client = tls_client,
+        .stream = t.stream,
+        .tls_client = t.tls,
         .protocol = .tls,
         .host = try allocator.dupe(u8, target_host),
         .port = target_port,
         .proxied = true,
     };
     return conn;
+}
+
+/// HTTP POST via curl subprocess (most stable for proxy+TLS).
+/// Uses system curl which handles proxy auth, TLS, chunked correctly.
+fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse {
+    // Build curl command.
+    var args = std.ArrayList([]const u8).init(allocator);
+    defer args.deinit();
+    try args.append("curl");
+    try args.append("-s");
+    try args.append("-S");
+    try args.append("--max-time");
+    try args.append("30");
+    try args.append("-X");
+    try args.append("POST");
+    // URL
+    const url = try std.fmt.allocPrint(allocator, "{s}", .{req.url});
+    defer allocator.free(url);
+    try args.append(url);
+    // Headers
+    for (req.headers.items) |h| {
+        const hs = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
+        defer allocator.free(hs);
+        try args.append("-H");
+        try args.append(hs);
+    }
+    // Body
+    if (req.body) |body| {
+        try args.append("--data-binary");
+        // Write body to temp file to avoid arg length limits.
+        const tmp_path = "/tmp/curl_body_tmp.json";
+        const f = try std.fs.cwd().createFile(tmp_path, .{});
+        try f.writeAll(body);
+        f.close();
+        const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{tmp_path});
+        defer allocator.free(data_arg);
+        try args.append(data_arg);
+    }
+    // Capture response body and status code.
+    try args.append("-w");
+    try args.append("\n%{http_code}");
+    try args.append("-o");
+    try args.append("-"); // stdout
+
+    var child = std.process.Child.init(args.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    var stdout = std.ArrayListUnmanaged(u8){};
+    defer stdout.deinit(allocator);
+    var stderr = std.ArrayListUnmanaged(u8){};
+    defer stderr.deinit(allocator);
+
+    try child.collectOutput(allocator, &stdout, &stderr, 16 * 1024 * 1024);
+    const term = try child.wait();
+
+    // Clean up temp file.
+    std.fs.cwd().deleteFile("/tmp/curl_body_tmp.json") catch {};
+
+    if (term.Exited != 0) {
+        return error.CurlFailed;
+    }
+
+    // Parse output: body + "\n" + status_code
+    const out = stdout.items;
+    const last_nl = std.mem.lastIndexOfScalar(u8, out, '\n') orelse return error.CurlBadOutput;
+    const code_str = std.mem.trim(u8, out[last_nl + 1 ..], " \r\n");
+    const status = std.fmt.parseInt(u16, code_str, 10) catch return error.CurlBadOutput;
+    const body = out[0..last_nl];
+
+    const headers = try allocator.alloc(std.http.Header, 0);
+    const body_copy = try allocator.dupe(u8, body);
+    return try makeStatusResponse(allocator, status, headers, body_copy);
+}
+
+/// Manual HTTP/1.1 request over an established TLS tunnel.
+/// Bypasses std.http.Client entirely for the proxied-HTTPS case.
+fn manualHttpOverTls(
+    allocator: std.mem.Allocator,
+    tls: *std.crypto.tls.Client,
+    stream: std.net.Stream,
+    method: std.http.Method,
+    uri: std.Uri,
+    headers: []const std.http.Header,
+    body: ?[]const u8,
+) !*HttpResponse {
+    const path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    // Build request.
+    var req_buf = std.ArrayList(u8).init(allocator);
+    defer req_buf.deinit();
+    const w = req_buf.writer();
+    try w.print("{s} {s} HTTP/1.0\r\n", .{ @tagName(method), path });
+    const host_str = switch (uri.host.?) { .raw => |s| s, .percent_encoded => |s| s };
+    try w.print("Host: {s}\r\n", .{host_str});
+    try w.writeAll("Connection: close\r\n");
+    try w.writeAll("Accept-Encoding: identity\r\n");
+    for (headers) |h| {
+        // Skip Accept-Encoding, we already set it.
+        if (std.ascii.eqlIgnoreCase(h.name, "Accept-Encoding")) continue;
+        try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+    }
+    if (body) |b| {
+        try w.print("Content-Length: {d}\r\n", .{b.len});
+    }
+    try w.writeAll("\r\n");
+    if (body) |b| {
+        try w.writeAll(b);
+    }
+    try tls.writeAll(stream, req_buf.items);
+
+    // Read response headers.
+    var resp_buf = std.ArrayList(u8).init(allocator);
+    defer resp_buf.deinit();
+    var tmp: [8192]u8 = undefined;
+    var header_end: ?usize = null;
+    while (header_end == null) {
+        const n = tls.read(stream, tmp[0..]) catch |err| {
+            return err;
+        };
+        if (n == 0) {
+            return error.HttpResponseEof;
+        }
+        try resp_buf.appendSlice(tmp[0..n]);
+        if (std.mem.indexOf(u8, resp_buf.items, "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+        }
+        if (resp_buf.items.len > 64 * 1024) return error.HttpHeadersTooLarge;
+    }
+    const he = header_end.?;
+    // Parse status.
+    const status_line_end = std.mem.indexOf(u8, resp_buf.items[0..he], "\r\n") orelse return error.HttpBadResponse;
+    var parts = std.mem.splitScalar(u8, resp_buf.items[0..status_line_end], ' ');
+    _ = parts.next();
+    const code_str = parts.next() orelse return error.HttpBadResponse;
+    const status_code = std.fmt.parseInt(u16, code_str, 10) catch return error.HttpBadResponse;
+    // Parse headers.
+    var resp_headers = std.ArrayList(std.http.Header).init(allocator);
+    errdefer resp_headers.deinit();
+    var hdr_iter = std.mem.splitSequence(u8, resp_buf.items[status_line_end + 2 .. he - 2], "\r\n");
+    var content_length: ?usize = null;
+    var is_chunked = false;
+    while (hdr_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
+            is_chunked = true;
+        }
+        try resp_headers.append(.{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, value) });
+    }
+    // Read body.
+    var body_out = std.ArrayList(u8).init(allocator);
+    errdefer body_out.deinit();
+    // Any body bytes already read after headers.
+    if (resp_buf.items.len > he) {
+        try body_out.appendSlice(resp_buf.items[he..]);
+    }
+    // Simplified: read until connection close (we sent Connection: close).
+    // For chunked, read until we see the 0-chunk terminator, then de-chunk.
+    if (is_chunked) {
+        var raw = std.ArrayList(u8).init(allocator);
+        defer raw.deinit();
+        try raw.appendSlice(body_out.items);
+        // Read until we find the chunked terminator "0\r\n\r\n" or "0\r\n" at end.
+        var found_end = false;
+        while (!found_end) {
+            if (std.mem.indexOf(u8, raw.items, "\r\n0\r\n\r\n") != null or
+                std.mem.endsWith(u8, raw.items, "\r\n0\r\n\r\n") or
+                std.mem.endsWith(u8, raw.items, "\r\n0\r\n")) {
+                found_end = true;
+                break;
+            }
+            const n = tls.read(stream, tmp[0..]) catch |err| {
+                return err;
+            };
+            if (n == 0) break; // EOF, try to parse what we have
+            try raw.appendSlice(tmp[0..n]);
+            // Safety: don't read forever
+            if (raw.items.len > 10 * 1024 * 1024) return error.HttpResponseTooLarge;
+        }
+        // De-chunk: parse chunk sizes and extract data.
+        body_out.clearRetainingCapacity();
+        var pos: usize = 0;
+        while (pos < raw.items.len) {
+            const line_end_opt = std.mem.indexOf(u8, raw.items[pos..], "\r\n");
+            if (line_end_opt == null) break;
+            const line_end = line_end_opt.? + pos;
+            const line = raw.items[pos..line_end];
+            const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+            const chunk_size = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..semi], " "), 16) catch break;
+            pos = line_end + 2;
+            if (chunk_size == 0) break;
+            if (pos + chunk_size > raw.items.len) break;
+            try body_out.appendSlice(raw.items[pos .. pos + chunk_size]);
+            pos += chunk_size + 2; // skip data and trailing CRLF
+        }
+    } else if (content_length) |cl| {
+        while (body_out.items.len < cl) {
+            const n = try tls.read(stream, tmp[0..]);
+            if (n == 0) return error.HttpResponseEof;
+            try body_out.appendSlice(tmp[0..n]);
+        }
+        if (body_out.items.len > cl) {
+            try body_out.resize(cl);
+        }
+    } else {
+        // No Content-Length, not chunked: use buffered data only.
+        // Server should have sent everything with headers (HTTP/1.0).
+    }
+
+    const headers_slice = try resp_headers.toOwnedSlice();
+    errdefer {
+        for (headers_slice) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers_slice);
+    }
+    return try makeStatusResponse(allocator, status_code, headers_slice, try body_out.toOwnedSlice());
 }
 
 fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
@@ -538,48 +774,37 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
         try req.headers.append(.{ .name = ae_name, .value = ae_val });
     }
     var header_buf: [16 * 1024]u8 = undefined;
-    // For HTTPS through a proxy, bypass Zig 0.14.1's buggy connectTunnel()
-    // entirely: build the tunnel + TLS handshake deterministically ourselves
-    // and hand the ready connection to open().
-    var manual_conn: ?*std.http.Client.Connection = null;
-    defer if (manual_conn) |c| {
-        // The request takes ownership via options.connection; only clean up
-        // here if open() failed before adopting it.
-        c.stream.close();
-        req.allocator.destroy(c.tls_client);
-        req.allocator.free(c.host);
-        req.allocator.destroy(c);
-    };
     if (std.mem.eql(u8, uri.scheme, "https") and req.client.client.https_proxy != null) {
         const target_port = uri.port orelse 443;
         const target_host = uri.host orelse return error.InvalidUri;
-        // host may be .raw; resolve to a string slice
         const host_str = switch (target_host) {
             .raw => |s| s,
             .percent_encoded => |s| s,
         };
-        manual_conn = connectHttpsProxyTunnel(
-            &req.client.client,
-            req.allocator,
-            host_str,
-            target_port,
-        ) catch |err| {
-            manual_conn = null;
-            return err;
-        };
+        // For proxy+TLS, try curl first (most stable), fallback to manual.
+        // Outer if already ensured https + proxy, so just try curl.
+        if (curlHttpPost(req.allocator, req)) |resp| {
+            return resp;
+        } else |_| {
+            // Fallback to manual on curl failure.
+        }
+        // Manual path: tunnel + TLS + raw HTTP/1.0, bypassing std.http.Client.
+        const t = try establishProxyTlsTunnel(&req.client.client, req.allocator, host_str, target_port);
+        defer {
+            req.allocator.destroy(t.tls);
+            t.stream.close();
+        }
+        return try manualHttpOverTls(req.allocator, t.tls, t.stream, req.method, uri, req.headers.items, req.body);
     }
     var request = try req.client.client.open(req.method, uri, .{
         .server_header_buffer = &header_buf,
         .keep_alive = false,
         .headers = .{},
         .extra_headers = req.headers.items,
-        .connection = manual_conn,
     });
-    // open() adopted the connection.
-    manual_conn = null;
     defer request.deinit();
 
-    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;
+    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;
     try request.send();
     if (req.body) |body| {
         try request.writeAll(body);
