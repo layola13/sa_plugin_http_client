@@ -53,3 +53,14 @@ See [docs/http_client_v2_abi.md](docs/http_client_v2_abi.md) for the ABI contrac
 All pre-existing v1 symbols and return codes remain unchanged. The four legacy blocking WebSocket exports are now declared in `sa_http_client.sai` so existing native symbols are visible, but new code should use the `_v2` functions.
 
 The product target is Linux x86_64. HTTP/2, HTTP/3, strict nonblocking TLS record resumption, automatic retries, and interruptible DNS are outside this foundation.
+
+## 已知安装问题（2026-10-08 实测）
+
+- **sci 检出路径**：`build.zig` 默认 `-Dsci-root=../../sci`（同级检出布局）。扁平单仓布局（如所有仓并列于同一目录）下该相对路径解析不到 sci，
+  报错 `'/content/sci/src/runtime/sa_net_primitives.zig' file_hash FileNotFound` 类。解法（三选一）：按同级布局检出、
+  建 symlink（如 `ln -s /content/sa_all/sci /content/sci`，零仓库改动）、或构建时传 `-Dsci-root=<sci 绝对路径>`
+ （注：`sa plugin install` 不透传该选项，走安装器时只能用前两种）。
+- **真 zig 必须在 `PATH` 首位**：环境若有 zig shim（如 node 版包装器），构建报 `TestOptions` 结构错。安装前执行
+  `export PATH=<zig-0.14.1-dir>:$PATH`（本仓要求 Zig ≥ 0.14.1）。
+- **特权确认**：含宽网权限的插件正式安装需 TTY 下输入确切插件名确认；本机开发验证可用 `sa plugin install --dev .`
+ （配 `SA_PLUGIN_DEV=1` 测试），如 README Development 节所示。
