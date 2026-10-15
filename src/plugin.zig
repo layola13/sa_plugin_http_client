@@ -4,6 +4,13 @@ const plugin_helpers = @import("plugin_helpers.zig");
 const sio = @import("sio");
 const _http_api_v1 = @import("http_saasm_api.zig");
 const _http_api_v2 = @import("http_v2_api.zig");
+// NOTE(Zig 0.17): force emission of the api modules' `export fn` symbols
+// (plain `pub const` aliases alone are pruned, breaking `sa plugin install`
+// ABI verification).
+comptime {
+    _ = _http_api_v1;
+    _ = _http_api_v2;
+}
 // NOTE(Zig 0.17): `usingnamespace` was removed; explicit re-exports preserve plugin.* ABI.
 pub const SaHttpClientHandle = _http_api_v1.SaHttpClientHandle;
 pub const SaHttpRequestHandle = _http_api_v1.SaHttpRequestHandle;
@@ -323,9 +330,13 @@ pub fn runHttpClientCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*
     const result = runHttpClientCommand(ctx, args, stdout_writer, stderr_writer) catch |err| {
         if (!isHttpClientCliError(err)) return @intFromEnum(plugin_api.AbiStatus.failed);
         writeHttpClientCliError(stderr_writer, args, err) catch return @intFromEnum(plugin_api.AbiStatus.failed);
+        stdout_writer.flush() catch return @intFromEnum(plugin_api.AbiStatus.failed);
+        stderr_writer.flush() catch return @intFromEnum(plugin_api.AbiStatus.failed);
         out_code.* = 1;
         return @intFromEnum(plugin_api.AbiStatus.ok);
     };
+    stdout_writer.flush() catch return @intFromEnum(plugin_api.AbiStatus.failed);
+    stderr_writer.flush() catch return @intFromEnum(plugin_api.AbiStatus.failed);
     if (result) |code| {
         out_code.* = code;
         return @intFromEnum(plugin_api.AbiStatus.ok);
