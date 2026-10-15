@@ -1,5 +1,5 @@
 const std = @import("std");
-const plugin_api = @import("plugin_api.zig");
+const plugin_api = @import("plugin_api");
 const sa_std_net = @import("sa_std_net.zig");
 pub const SaHttpClientHandle = extern struct {
     impl: ?*anyopaque,
@@ -94,7 +94,7 @@ pub const HttpRequest = struct {
     method: std.http.Method,
     url: []const u8,
     body: ?[]const u8 = null,
-    headers: std.ArrayList(std.http.Header),
+    headers: std.array_list.Managed(std.http.Header),
     timeout_ms: u32 = 0,
     max_response_bytes: u64 = 16 * 1024 * 1024,
     retains_client: bool = false,
@@ -112,7 +112,7 @@ pub const HttpRequest = struct {
                 .delete => .DELETE,
             },
             .url = try client.allocator.dupe(u8, cfg.url),
-            .headers = std.ArrayList(std.http.Header).init(client.allocator),
+            .headers = std.array_list.Managed(std.http.Header).init(client.allocator),
         };
         errdefer client.allocator.free(self.url);
         errdefer self.headers.deinit();
@@ -215,7 +215,7 @@ fn cloneRequestForAsync(src: *HttpRequest) !*HttpRequest {
         .client = src.client,
         .method = src.method,
         .url = try allocator.dupe(u8, src.url),
-        .headers = std.ArrayList(std.http.Header).init(allocator),
+        .headers = std.array_list.Managed(std.http.Header).init(allocator),
         .timeout_ms = src.timeout_ms,
         .max_response_bytes = src.max_response_bytes,
         .retains_client = true,
@@ -403,7 +403,7 @@ fn maybeBypassProxy(req: *HttpRequest, uri: std.Uri) void {
 }
 
 fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.Response) ![]std.http.Header {
-    var headers = std.ArrayList(std.http.Header).init(allocator);
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
     errdefer {
         for (headers.items) |header| {
             allocator.free(header.name);
@@ -533,7 +533,7 @@ pub fn connectHttpsProxyTunnel(
 /// Uses system curl which handles proxy auth, TLS, chunked correctly.
 fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse {
     // Build curl command.
-    var args = std.ArrayList([]const u8).init(allocator);
+    var args = std.array_list.Managed([]const u8).init(allocator);
     defer args.deinit();
     try args.append("curl");
     try args.append("-s");
@@ -576,9 +576,9 @@ fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse 
     child.stderr_behavior = .Pipe;
     try child.spawn();
 
-    var stdout = std.ArrayListUnmanaged(u8){};
+    var stdout = std.ArrayList(u8).empty;
     defer stdout.deinit(allocator);
-    var stderr = std.ArrayListUnmanaged(u8){};
+    var stderr = std.ArrayList(u8).empty;
     defer stderr.deinit(allocator);
 
     try child.collectOutput(allocator, &stdout, &stderr, 16 * 1024 * 1024);
@@ -616,7 +616,7 @@ fn manualHttpOverTls(
 ) !*HttpResponse {
     const path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
     // Build request.
-    var req_buf = std.ArrayList(u8).init(allocator);
+    var req_buf = std.array_list.Managed(u8).init(allocator);
     defer req_buf.deinit();
     const w = req_buf.writer();
     try w.print("{s} {s} HTTP/1.0\r\n", .{ @tagName(method), path });
@@ -639,7 +639,7 @@ fn manualHttpOverTls(
     try tls.writeAll(stream, req_buf.items);
 
     // Read response headers.
-    var resp_buf = std.ArrayList(u8).init(allocator);
+    var resp_buf = std.array_list.Managed(u8).init(allocator);
     defer resp_buf.deinit();
     var tmp: [8192]u8 = undefined;
     var header_end: ?usize = null;
@@ -664,7 +664,7 @@ fn manualHttpOverTls(
     const code_str = parts.next() orelse return error.HttpBadResponse;
     const status_code = std.fmt.parseInt(u16, code_str, 10) catch return error.HttpBadResponse;
     // Parse headers.
-    var resp_headers = std.ArrayList(std.http.Header).init(allocator);
+    var resp_headers = std.array_list.Managed(std.http.Header).init(allocator);
     errdefer resp_headers.deinit();
     var hdr_iter = std.mem.splitSequence(u8, resp_buf.items[status_line_end + 2 .. he - 2], "\r\n");
     var content_length: ?usize = null;
@@ -682,7 +682,7 @@ fn manualHttpOverTls(
         try resp_headers.append(.{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, value) });
     }
     // Read body.
-    var body_out = std.ArrayList(u8).init(allocator);
+    var body_out = std.array_list.Managed(u8).init(allocator);
     errdefer body_out.deinit();
     // Any body bytes already read after headers.
     if (resp_buf.items.len > he) {
@@ -691,7 +691,7 @@ fn manualHttpOverTls(
     // Simplified: read until connection close (we sent Connection: close).
     // For chunked, read until we see the 0-chunk terminator, then de-chunk.
     if (is_chunked) {
-        var raw = std.ArrayList(u8).init(allocator);
+        var raw = std.array_list.Managed(u8).init(allocator);
         defer raw.deinit();
         try raw.appendSlice(body_out.items);
         // Read until we find the chunked terminator "0\r\n\r\n" or "0\r\n" at end.
@@ -838,7 +838,7 @@ fn httpRequestExecOnce(req: *HttpRequest) !*HttpResponse {
     try request.finish();
     try request.wait();
 
-    var body = std.ArrayList(u8).init(req.allocator);
+    var body = std.array_list.Managed(u8).init(req.allocator);
     errdefer body.deinit();
     try request.reader().readAllArrayList(&body, 16 * 1024 * 1024);
     const headers = try cloneResponseHeaders(req.allocator, request.response);
@@ -877,8 +877,8 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
     }
 }
 
-fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.ArrayList(u8) {
-    var out = std.ArrayList(u8).init(allocator);
+fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.array_list.Managed(u8) {
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [1024]u8 = undefined;
     while (true) {
@@ -1445,7 +1445,7 @@ pub export fn sa_http_client_sse_post(
         }
     }
 
-    var args = std.ArrayList([]const u8).init(allocator);
+    var args = std.array_list.Managed([]const u8).init(allocator);
     defer args.deinit();
     args.append("curl") catch return 1;
     args.append("-s") catch return 1;
@@ -1643,9 +1643,9 @@ fn sseTurnStream(
     const allocator = std.heap.page_allocator;
     const s = @as(*SseStream, @ptrCast(@alignCast(handle.?)));
 
-    var text = std.ArrayList(u8).init(allocator);
+    var text = std.array_list.Managed(u8).init(allocator);
     defer text.deinit();
-    var calls = std.ArrayList(SseCall).init(allocator);
+    var calls = std.array_list.Managed(SseCall).init(allocator);
     defer {
         for (calls.items) |*c| {
             if (c.call_id.len > 0) allocator.free(c.call_id);
@@ -1655,7 +1655,7 @@ fn sseTurnStream(
         }
         calls.deinit();
     }
-    var active = std.ArrayList(SseCall).init(allocator);
+    var active = std.array_list.Managed(SseCall).init(allocator);
     defer {
         // Free any remaining active calls.
         for (active.items) |*ac| {
@@ -1668,7 +1668,7 @@ fn sseTurnStream(
     }
     var stream_done = false;
 
-    var buf = std.ArrayList(u8).init(allocator);
+    var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
     var processed_offset: usize = 0;
 
@@ -1734,7 +1734,7 @@ fn sseTurnStream(
     stdout.writeAll("\n") catch {};
 
     // Build calls JSON first (so text isn't leaked on failure).
-    var calls_json = std.ArrayList(u8).init(allocator);
+    var calls_json = std.array_list.Managed(u8).init(allocator);
     defer calls_json.deinit();
     calls_json.appendSlice("[") catch return 2;
     for (calls.items, 0..) |c, i| {
@@ -1819,7 +1819,7 @@ fn sseFindEventEnd(data: []const u8) ?SseDelim {
 
 fn sseParseEventData(allocator: std.mem.Allocator, ev: []const u8) ?SseEventData {
     // SSE spec: multiple "data:" lines are joined with "\n".
-    var parts = std.ArrayList([]const u8).init(allocator);
+    var parts = std.array_list.Managed([]const u8).init(allocator);
     defer parts.deinit();
     var is_done = false;
     var lines = std.mem.splitScalar(u8, ev, '\n');
@@ -1848,9 +1848,9 @@ fn sseHandleEvent(
     allocator: std.mem.Allocator,
     data: []const u8,
     api_mode: u64,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {
@@ -1865,7 +1865,7 @@ fn sseHandleEvent(
 }
 
 // Find an active call by key (call_id for responses, index string for chat).
-fn sseFindActive(active: *std.ArrayList(SseCall), key: []const u8) ?*SseCall {
+fn sseFindActive(active: *std.array_list.Managed(SseCall), key: []const u8) ?*SseCall {
     for (active.items) |*ac| {
         if (std.mem.eql(u8, ac.key, key)) return ac;
     }
@@ -1873,7 +1873,7 @@ fn sseFindActive(active: *std.ArrayList(SseCall), key: []const u8) ?*SseCall {
 }
 
 // Move all active calls to the completed list (finalize).
-fn sseFinalizeActive(allocator: std.mem.Allocator, active: *std.ArrayList(SseCall), calls: *std.ArrayList(SseCall)) !void {
+fn sseFinalizeActive(allocator: std.mem.Allocator, active: *std.array_list.Managed(SseCall), calls: *std.array_list.Managed(SseCall)) !void {
     for (active.items) |*ac| {
         if (ac.name.len > 0) {
             try calls.append(ac.*);
@@ -1897,9 +1897,9 @@ fn sseJsonStr(val: std.json.Value) ?[]const u8 {
 fn sseHandleResponsesEvent(
     allocator: std.mem.Allocator,
     root: std.json.Value,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {
@@ -1988,9 +1988,9 @@ fn sseHandleResponsesEvent(
 fn sseHandleChatEvent(
     allocator: std.mem.Allocator,
     root: std.json.Value,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {

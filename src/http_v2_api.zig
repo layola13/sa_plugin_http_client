@@ -262,7 +262,7 @@ fn setConnectionTimeout(connection: *std.http.Client.Connection, timeout_ms: u32
 }
 
 fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.Response) ![]std.http.Header {
-    var headers = std.ArrayList(std.http.Header).init(allocator);
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
     errdefer {
         for (headers.items) |header| {
             allocator.free(header.name);
@@ -386,7 +386,7 @@ fn executeRequestV2(request: *legacy.HttpRequest, tracker: ?*V2AsyncOp) V2Error!
     const headers = cloneResponseHeaders(request.allocator, http_request.response) catch return error.Io;
     errdefer freeResponseHeaders(request.allocator, headers);
 
-    var body = std.ArrayList(u8).init(request.allocator);
+    var body = std.array_list.Managed(u8).init(request.allocator);
     errdefer body.deinit();
     var response_reader = http_request.reader();
     var read_buffer: [8192]u8 = undefined;
@@ -432,7 +432,7 @@ fn cloneRequestV2(source: *legacy.HttpRequest) !*legacy.HttpRequest {
         .client = source.client,
         .method = source.method,
         .url = try allocator.dupe(u8, source.url),
-        .headers = std.ArrayList(std.http.Header).init(allocator),
+        .headers = std.array_list.Managed(std.http.Header).init(allocator),
         .timeout_ms = source.timeout_ms,
         .max_response_bytes = source.max_response_bytes,
         .retains_client = true,
@@ -624,9 +624,9 @@ const WebSocketV2 = struct {
     allocator: std.mem.Allocator,
     client: *legacy.HttpClient,
     connection: *std.http.Client.Connection,
-    receive_buffer: std.ArrayList(u8),
+    receive_buffer: std.array_list.Managed(u8),
     receive_start: usize = 0,
-    fragment_buffer: std.ArrayList(u8),
+    fragment_buffer: std.array_list.Managed(u8),
     fragment_opcode: ?u8 = null,
     last_message: ?[]u8 = null,
     pending_pong: ?[]u8 = null,
@@ -641,8 +641,8 @@ const WebSocketV2 = struct {
             .allocator = client.allocator,
             .client = client,
             .connection = connection,
-            .receive_buffer = std.ArrayList(u8).init(client.allocator),
-            .fragment_buffer = std.ArrayList(u8).init(client.allocator),
+            .receive_buffer = std.array_list.Managed(u8).init(client.allocator),
+            .fragment_buffer = std.array_list.Managed(u8).init(client.allocator),
         };
         connection.closing = true;
         return self;
@@ -770,7 +770,7 @@ fn websocketConnect(
     var key_buffer: [24]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&key_buffer, &key_bytes);
 
-    var request_headers = std.ArrayList(std.http.Header).init(client.allocator);
+    var request_headers = std.array_list.Managed(std.http.Header).init(client.allocator);
     defer request_headers.deinit();
     for (headers) |header| {
         if (reservedWebSocketHeader(header.name)) continue;

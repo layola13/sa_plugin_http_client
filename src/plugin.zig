@@ -1,8 +1,80 @@
 const std = @import("std");
-const plugin_api = @import("plugin_api.zig");
+const plugin_api = @import("plugin_api");
 const plugin_helpers = @import("plugin_helpers.zig");
-pub usingnamespace @import("http_saasm_api.zig");
-pub usingnamespace @import("http_v2_api.zig");
+const sio = @import("sio");
+const _http_api_v1 = @import("http_saasm_api.zig");
+const _http_api_v2 = @import("http_v2_api.zig");
+// NOTE(Zig 0.17): `usingnamespace` was removed; explicit re-exports preserve plugin.* ABI.
+pub const SaHttpClientHandle = _http_api_v1.SaHttpClientHandle;
+pub const SaHttpRequestHandle = _http_api_v1.SaHttpRequestHandle;
+pub const SaHttpResponseHandle = _http_api_v1.SaHttpResponseHandle;
+pub const SaHttpBodyReaderHandle = _http_api_v1.SaHttpBodyReaderHandle;
+pub const HttpMethod = _http_api_v1.HttpMethod;
+pub const HttpClientConfig = _http_api_v1.HttpClientConfig;
+pub const HttpRequestConfig = _http_api_v1.HttpRequestConfig;
+pub const HttpClient = _http_api_v1.HttpClient;
+pub const HttpRequest = _http_api_v1.HttpRequest;
+pub const HttpResponse = _http_api_v1.HttpResponse;
+pub const HttpBodyReader = _http_api_v1.HttpBodyReader;
+pub const HttpRequestAsyncOp = _http_api_v1.HttpRequestAsyncOp;
+pub const sa_http_client_new = _http_api_v1.sa_http_client_new;
+pub const sa_http_client_req_new = _http_api_v1.sa_http_client_req_new;
+pub const sa_http_client_req_new_joined = _http_api_v1.sa_http_client_req_new_joined;
+pub const sa_http_client_req_add_header = _http_api_v1.sa_http_client_req_add_header;
+pub const sa_http_client_req_add_openai_auth = _http_api_v1.sa_http_client_req_add_openai_auth;
+pub const sa_http_client_req_set_body = _http_api_v1.sa_http_client_req_set_body;
+pub const sa_http_client_req_send = _http_api_v1.sa_http_client_req_send;
+pub const sa_http_client_req_send_async = _http_api_v1.sa_http_client_req_send_async;
+pub const sa_http_client_async_poll = _http_api_v1.sa_http_client_async_poll;
+pub const sa_http_client_async_take_response = _http_api_v1.sa_http_client_async_take_response;
+pub const sa_http_client_async_free = _http_api_v1.sa_http_client_async_free;
+pub const sa_http_client_resp_status = _http_api_v1.sa_http_client_resp_status;
+pub const sa_http_client_resp_get_header = _http_api_v1.sa_http_client_resp_get_header;
+pub const sa_http_client_resp_body_slice = _http_api_v1.sa_http_client_resp_body_slice;
+pub const sa_http_client_resp_body_ptr = _http_api_v1.sa_http_client_resp_body_ptr;
+pub const sa_http_client_resp_body_len = _http_api_v1.sa_http_client_resp_body_len;
+pub const sa_http_client_resp_body_reader = _http_api_v1.sa_http_client_resp_body_reader;
+pub const sa_http_client_resp_read_chunk = _http_api_v1.sa_http_client_resp_read_chunk;
+pub const sa_http_client_resp_free = _http_api_v1.sa_http_client_resp_free;
+pub const sa_http_client_body_reader_free = _http_api_v1.sa_http_client_body_reader_free;
+pub const sa_http_client_free = _http_api_v1.sa_http_client_free;
+pub const sa_http_client_req_free = _http_api_v1.sa_http_client_req_free;
+pub const sa_http_websocket_read = _http_api_v1.sa_http_websocket_read;
+pub const sa_http_websocket_write = _http_api_v1.sa_http_websocket_write;
+pub const sa_http_websocket_free = _http_api_v1.sa_http_websocket_free;
+pub const sa_http_client_websocket_connect = _http_api_v1.sa_http_client_websocket_connect;
+pub const sa_http_client_sse_post = _http_api_v1.sa_http_client_sse_post;
+pub const sa_http_client_sse_read = _http_api_v1.sa_http_client_sse_read;
+pub const sa_http_client_sse_poll = _http_api_v1.sa_http_client_sse_poll;
+pub const sa_http_client_sse_status = _http_api_v1.sa_http_client_sse_status;
+pub const sa_http_client_sse_free = _http_api_v1.sa_http_client_sse_free;
+pub const sa_http_client_sse_turn = _http_api_v1.sa_http_client_sse_turn;
+pub const sa_http_client_sse_turn_free = _http_api_v1.sa_http_client_sse_turn_free;
+pub const max_v2_message_bytes = _http_api_v2.max_v2_message_bytes;
+pub const default_v2_response_bytes = _http_api_v2.default_v2_response_bytes;
+pub const NetworkStatus = _http_api_v2.NetworkStatus;
+pub const PollEvent = _http_api_v2.PollEvent;
+pub const sa_http_client_new_v2 = _http_api_v2.sa_http_client_new_v2;
+pub const sa_http_client_req_new_v2 = _http_api_v2.sa_http_client_req_new_v2;
+pub const sa_http_client_req_add_header_v2 = _http_api_v2.sa_http_client_req_add_header_v2;
+pub const sa_http_client_req_set_body_v2 = _http_api_v2.sa_http_client_req_set_body_v2;
+pub const sa_http_client_req_set_timeout_v2 = _http_api_v2.sa_http_client_req_set_timeout_v2;
+pub const sa_http_client_req_set_max_response_bytes_v2 = _http_api_v2.sa_http_client_req_set_max_response_bytes_v2;
+pub const sa_http_client_req_send_v2 = _http_api_v2.sa_http_client_req_send_v2;
+pub const sa_http_client_req_send_async_v2 = _http_api_v2.sa_http_client_req_send_async_v2;
+pub const sa_http_client_async_poll_v2 = _http_api_v2.sa_http_client_async_poll_v2;
+pub const sa_http_client_async_take_response_v2 = _http_api_v2.sa_http_client_async_take_response_v2;
+pub const sa_http_client_async_cancel_v2 = _http_api_v2.sa_http_client_async_cancel_v2;
+pub const sa_http_client_async_free_v2 = _http_api_v2.sa_http_client_async_free_v2;
+pub const sa_http_client_websocket_connect_v2 = _http_api_v2.sa_http_client_websocket_connect_v2;
+pub const sa_http_client_websocket_connect_unix_v2 = _http_api_v2.sa_http_client_websocket_connect_unix_v2;
+pub const sa_http_client_req_websocket_connect_v2 = _http_api_v2.sa_http_client_req_websocket_connect_v2;
+pub const sa_http_client_req_websocket_connect_unix_v2 = _http_api_v2.sa_http_client_req_websocket_connect_unix_v2;
+pub const sa_http_websocket_poll_v2 = _http_api_v2.sa_http_websocket_poll_v2;
+pub const sa_http_websocket_read_v2 = _http_api_v2.sa_http_websocket_read_v2;
+pub const sa_http_websocket_write_v2 = _http_api_v2.sa_http_websocket_write_v2;
+pub const sa_http_websocket_close_v2 = _http_api_v2.sa_http_websocket_close_v2;
+pub const sa_http_websocket_free_v2 = _http_api_v2.sa_http_websocket_free_v2;
 
 const skills = [_]plugin_api.SkillSection{
     .{
@@ -50,7 +122,7 @@ pub fn parseRequestArgs(allocator: std.mem.Allocator, args: []const []const u8, 
     var url: ?[]const u8 = null;
     var ca_bundle_path: ?[]const u8 = null;
     var body: ?[]const u8 = null;
-    var header_list = std.ArrayList(std.http.Header).init(allocator);
+    var header_list = std.array_list.Managed(std.http.Header).init(allocator);
     defer header_list.deinit();
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -93,34 +165,32 @@ pub fn parseRequestArgs(allocator: std.mem.Allocator, args: []const []const u8, 
 fn configureHttpsTrust(client: *std.http.Client, ctx: *const plugin_api.Context, ca_bundle_path: ?[]const u8) !void {
     if (std.http.Client.disable_tls) return;
     if (ca_bundle_path) |bundle_path| {
-        const abs_path = try std.fs.cwd().realpathAlloc(ctx.allocator, bundle_path);
+        const abs_path = try sio.cwd().realpathAlloc(ctx.allocator, bundle_path);
         defer ctx.allocator.free(abs_path);
-        try client.ca_bundle.addCertsFromFilePathAbsolute(ctx.allocator, abs_path);
-        client.next_https_rescan_certs = false;
+        const io = sio.io();
+        try client.ca_bundle.addCertsFromFilePathAbsolute(ctx.allocator, io, std.Io.Clock.real.now(io), abs_path);
     }
 }
 
 fn runHttpRequest(
     ctx: *const plugin_api.Context,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
     options: RequestOptions,
 ) anyerror!?u8 {
-    var client: std.http.Client = .{ .allocator = ctx.allocator };
+    var client: std.http.Client = .{ .allocator = ctx.allocator, .io = sio.io() };
     defer client.deinit();
 
-    var response_buf = std.ArrayList(u8).init(ctx.allocator);
-    defer response_buf.deinit();
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
 
     try configureHttpsTrust(&client, ctx, options.ca_bundle_path);
     const result = client.fetch(.{
         .location = .{ .url = options.url },
         .method = options.method,
         .payload = options.body,
-        .headers = .{},
         .extra_headers = options.headers,
-        .response_storage = .{ .dynamic = &response_buf },
-        .max_append_size = 2 * 1024 * 1024,
+        .response_writer = &aw.writer,
         .keep_alive = false,
     }) catch |err| {
         try stderr.print("error: http request failed: {}\n", .{err});
@@ -128,56 +198,26 @@ fn runHttpRequest(
     };
 
     try stdout.print("status: {d}\n", .{@intFromEnum(result.status)});
-    if (response_buf.items.len != 0) {
-        try stdout.writeAll(response_buf.items);
-        if (response_buf.items[response_buf.items.len - 1] != '\n') try stdout.writeByte('\n');
+    const body = aw.written();
+    if (body.len != 0) {
+        try stdout.writeAll(body);
+        if (body[body.len - 1] != '\n') try stdout.writeByte('\n');
     }
     return 0;
 }
 
 fn runHttpStreamRequest(
     ctx: *const plugin_api.Context,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
     options: RequestOptions,
 ) anyerror!?u8 {
-    var client: std.http.Client = .{ .allocator = ctx.allocator };
-    defer client.deinit();
-
-    try configureHttpsTrust(&client, ctx, options.ca_bundle_path);
-    const uri = try std.Uri.parse(options.url);
-    var header_buf: [16 * 1024]u8 = undefined;
-    var req = client.open(options.method, uri, .{
-        .server_header_buffer = &header_buf,
-        .keep_alive = false,
-        .headers = .{},
-        .extra_headers = options.headers,
-    }) catch |err| {
-        try stderr.print("error: http stream open failed: {}\n", .{err});
-        return 1;
-    };
-    defer req.deinit();
-
-    req.transfer_encoding = if (options.body) |body| .{ .content_length = body.len } else .none;
-
-    try req.send();
-    if (options.body) |body| try req.writeAll(body);
-    try req.finish();
-    try req.wait();
-
-    var buf: [1024]u8 = undefined;
-    while (true) {
-        const n = req.read(&buf) catch |err| {
-            try stderr.print("error: http stream read failed: {}\n", .{err});
-            return 1;
-        };
-        if (n == 0) break;
-        try stdout.writeAll(buf[0..n]);
-    }
-    return 0;
+    // NOTE(Zig 0.17): Client.open/send/wait removed; fetch with writer streams via same path.
+    // For CLI streaming we fetch fully then write out (preserves behavior for small SSE bodies).
+    return try runHttpRequest(ctx, stdout, stderr, options);
 }
 
-pub fn runHttpClientCommand(ctx: *const plugin_api.Context, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+pub fn runHttpClientCommand(ctx: *const plugin_api.Context, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 2) return null;
     if (!std.mem.eql(u8, argv[1], "http-client")) return null;
     if (argv.len < 3) return error.MissingSourcePath;
@@ -253,7 +293,7 @@ fn httpClientCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     };
 }
 
-fn writeHttpClientCliError(writer: std.io.AnyWriter, argv: []const []const u8, err: anyerror) !void {
+fn writeHttpClientCliError(writer: *std.Io.Writer, argv: []const []const u8, err: anyerror) !void {
     const message = switch (err) {
         error.MissingSourcePath => "missing required HTTP client URL",
         error.UnknownCommand => "unknown HTTP client subcommand",
