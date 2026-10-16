@@ -1,6 +1,36 @@
 const std = @import("std");
-const plugin_api = @import("plugin_api.zig");
+const builtin = @import("builtin");
+const sio = @import("sio");
+const plugin_api = @import("plugin_api");
 const sa_std_net = @import("sa_std_net.zig");
+
+// NOTE(Zig 0.17): `std.net.tcpConnectToHost` was removed (only literals via
+// `IpAddress.parse`; DNS via `HostName.connect` with Happy Eyeballs).
+pub fn dialHost(host: []const u8, port: u16) !std.Io.net.Stream {
+    if (std.Io.net.IpAddress.parse(host, port)) |addr| {
+        var a = addr;
+        return a.connect(sio.io(), .{ .mode = .stream });
+    } else |_| {}
+    const hn = try std.Io.net.HostName.init(host);
+    return hn.connect(sio.io(), port, .{ .mode = .stream });
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return i;
+    }
+    return null;
+}
 pub const SaHttpClientHandle = extern struct {
     impl: ?*anyopaque,
 };
@@ -39,22 +69,30 @@ pub const HttpRequestConfig = struct {
 pub const HttpClient = struct {
     allocator: std.mem.Allocator,
     client: std.http.Client,
-    lifetime_mutex: std.Thread.Mutex = .{},
+    proxy_arena: std.heap.ArenaAllocator,
+    lifetime_mutex: std.atomic.Mutex = .unlocked,
     reference_count: usize = 1,
     // Serializes request execution so per-request proxy bypass (no_proxy)
     // can temporarily clear client.http_proxy/https_proxy safely.
-    request_mutex: std.Thread.Mutex = .{},
+    request_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, cfg: HttpClientConfig) !*HttpClient {
         const self = try allocator.create(HttpClient);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .client = .{ .allocator = allocator },
+            .client = .{ .allocator = allocator, .io = sio.io() },
+            .proxy_arena = std.heap.ArenaAllocator.init(allocator),
         };
+        errdefer self.proxy_arena.deinit();
         // Route through https_proxy/http_proxy env vars when present (sandboxed
         // environments may block direct DNS/TCP; the proxy path is required).
-        self.client.initDefaultProxies(allocator) catch {};
+        // NOTE(Zig 0.17): proxy env must be loaded explicitly via arena + map.
+        if (sio.getEnvMap(allocator)) |env| {
+            var owned_env = env;
+            defer owned_env.deinit();
+            self.client.initDefaultProxies(self.proxy_arena.allocator(), &owned_env) catch {};
+        } else |_| {}
         try self.configureHttpsTrust(cfg);
         return self;
     }
@@ -62,28 +100,33 @@ pub const HttpClient = struct {
     fn configureHttpsTrust(self: *HttpClient, cfg: HttpClientConfig) !void {
         if (std.http.Client.disable_tls or cfg.use_tls == 0) return;
         if (cfg.ca_bundle_path) |bundle_path| {
-            const abs_path = try std.fs.cwd().realpathAlloc(self.allocator, bundle_path);
+            const abs_path = try sio.cwd().realpathAlloc(self.allocator, bundle_path);
             defer self.allocator.free(abs_path);
-            try self.client.ca_bundle.addCertsFromFilePathAbsolute(self.allocator, abs_path);
-            self.client.next_https_rescan_certs = false;
+            try self.client.ca_bundle.addCertsFromFilePathAbsolute(
+                self.allocator,
+                sio.io(),
+                std.Io.Clock.real.now(sio.io()),
+                abs_path,
+            );
         }
     }
 
     pub fn retain(self: *HttpClient) void {
-        self.lifetime_mutex.lock();
+        while (!self.lifetime_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.lifetime_mutex.unlock();
         std.debug.assert(self.reference_count > 0);
         self.reference_count += 1;
     }
 
     pub fn release(self: *HttpClient) void {
-        self.lifetime_mutex.lock();
+        while (!self.lifetime_mutex.tryLock()) std.atomic.spinLoopHint();
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
         const destroy = self.reference_count == 0;
         self.lifetime_mutex.unlock();
         if (!destroy) return;
         self.client.deinit();
+        self.proxy_arena.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -94,7 +137,7 @@ pub const HttpRequest = struct {
     method: std.http.Method,
     url: []const u8,
     body: ?[]const u8 = null,
-    headers: std.ArrayList(std.http.Header),
+    headers: std.array_list.Managed(std.http.Header),
     timeout_ms: u32 = 0,
     max_response_bytes: u64 = 16 * 1024 * 1024,
     retains_client: bool = false,
@@ -112,7 +155,7 @@ pub const HttpRequest = struct {
                 .delete => .DELETE,
             },
             .url = try client.allocator.dupe(u8, cfg.url),
-            .headers = std.ArrayList(std.http.Header).init(client.allocator),
+            .headers = std.array_list.Managed(std.http.Header).init(client.allocator),
         };
         errdefer client.allocator.free(self.url);
         errdefer self.headers.deinit();
@@ -215,7 +258,7 @@ fn cloneRequestForAsync(src: *HttpRequest) !*HttpRequest {
         .client = src.client,
         .method = src.method,
         .url = try allocator.dupe(u8, src.url),
-        .headers = std.ArrayList(std.http.Header).init(allocator),
+        .headers = std.array_list.Managed(std.http.Header).init(allocator),
         .timeout_ms = src.timeout_ms,
         .max_response_bytes = src.max_response_bytes,
         .retains_client = true,
@@ -280,7 +323,7 @@ pub const HttpRequestAsyncOp = struct {
     allocator: std.mem.Allocator,
     request: *HttpRequest,
     thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     response: ?*HttpResponse = null,
 
@@ -299,20 +342,20 @@ pub const HttpRequestAsyncOp = struct {
 
     fn run(self: *HttpRequestAsyncOp) void {
         const response = httpRequestExec(self.request) catch null;
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         self.response = response;
         self.done = true;
         self.mutex.unlock();
     }
 
     fn poll(self: *HttpRequestAsyncOp) bool {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         return self.done;
     }
 
     fn takeResponse(self: *HttpRequestAsyncOp) ?*HttpResponse {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (!self.done) return null;
         const response = self.response orelse return null;
@@ -388,8 +431,8 @@ fn maybeBypassProxy(req: *HttpRequest, uri: std.Uri) void {
         .raw => |r| r,
         .percent_encoded => |p| p,
     };
-    const no_proxy = std.process.getEnvVarOwned(req.allocator, "no_proxy") catch
-        (std.process.getEnvVarOwned(req.allocator, "NO_PROXY") catch return);
+    const no_proxy = sio.getEnvVarOwned(req.allocator, "no_proxy") catch
+        (sio.getEnvVarOwned(req.allocator, "NO_PROXY") catch return);
     defer req.allocator.free(no_proxy);
     const port: u16 = uri.port orelse
         if (std.mem.eql(u8, uri.scheme, "https")) 443
@@ -403,7 +446,7 @@ fn maybeBypassProxy(req: *HttpRequest, uri: std.Uri) void {
 }
 
 fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.Response) ![]std.http.Header {
-    var headers = std.ArrayList(std.http.Header).init(allocator);
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
     errdefer {
         for (headers.items) |header| {
             allocator.free(header.name);
@@ -412,7 +455,7 @@ fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.
         headers.deinit();
     }
 
-    var it = response.iterateHeaders();
+    var it = response.head.iterateHeaders();
     while (it.next()) |header| {
         try headers.append(.{
             .name = try allocator.dupe(u8, header.name),
@@ -434,106 +477,12 @@ fn makeStatusResponse(allocator: std.mem.Allocator, status: u16, headers: []std.
     return resp;
 }
 
-/// Manually establish an HTTPS connection through an HTTP proxy.
-/// Replaces Zig 0.14.1's buggy connectTunnel() which builds the CONNECT
-/// tunnel over plain TCP but never performs the TLS handshake, leaving the
-/// Establishes a CONNECT tunnel through the HTTPS proxy and performs TLS
-/// handshake. Returns the TLS client and the underlying stream.
-/// The caller owns both and must close/destroy them.
-fn establishProxyTlsTunnel(
-    client: *std.http.Client,
-    allocator: std.mem.Allocator,
-    target_host: []const u8,
-    target_port: u16,
-) !struct { tls: *std.crypto.tls.Client, stream: std.net.Stream } {
-    const proxy = client.https_proxy orelse return error.NoProxy;
-    if (std.ascii.eqlIgnoreCase(proxy.host, target_host) and proxy.port == target_port) {
-        return error.ProxyLoop;
-    }
-
-    const stream = std.net.tcpConnectToHost(allocator, proxy.host, proxy.port) catch |err| {
-        return err;
-    };
-    errdefer stream.close();
-
-    // Set socket receive timeout to avoid infinite hangs (30 seconds).
-    {
-        const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
-    }
-
-    // Send CONNECT request.
-    var send_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&send_buf);
-    const w = fbs.writer();
-    try w.print("CONNECT {s}:{d} HTTP/1.1\r\n", .{ target_host, target_port });
-    try w.print("Host: {s}:{d}\r\n", .{ target_host, target_port });
-    if (proxy.authorization) |auth| {
-        try w.writeAll("Proxy-Authorization: ");
-        try w.writeAll(auth);
-        try w.writeAll("\r\n");
-    }
-    try w.writeAll("\r\n");
-    try stream.writeAll(fbs.getWritten());
-
-    // Read CONNECT response.
-    var resp_buf: [8192]u8 = undefined;
-    var resp_len: usize = 0;
-    while (resp_len < resp_buf.len) {
-        const n = try stream.read(resp_buf[resp_len..]);
-        if (n == 0) return error.ProxyClosedConnection;
-        resp_len += n;
-        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |_| break;
-    } else return error.ProxyResponseTooLarge;
-    const status_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ProxyBadResponse;
-    const status_line = resp_buf[0..status_end];
-    var parts = std.mem.splitScalar(u8, status_line, ' ');
-    _ = parts.next();
-    const code_str = parts.next() orelse return error.ProxyBadResponse;
-    const code = std.fmt.parseInt(u16, code_str, 10) catch return error.ProxyBadResponse;
-    if (code != 200) return error.ProxyConnectFailed;
-    const header_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n").? + 4;
-    if (header_end != resp_len) return error.ProxyUnexpectedData;
-
-    // TLS handshake.
-    const tls_client = try allocator.create(std.crypto.tls.Client);
-    errdefer allocator.destroy(tls_client);
-    tls_client.* = try std.crypto.tls.Client.init(stream, .{
-        .host = .{ .explicit = target_host },
-        .ca = .{ .bundle = client.ca_bundle },
-    });
-    tls_client.allow_truncation_attacks = true;
-
-    return .{ .tls = tls_client, .stream = stream };
-}
-
-/// Old wrapper kept for compatibility; prefer establishProxyTlsTunnel.
-pub fn connectHttpsProxyTunnel(
-    client: *std.http.Client,
-    allocator: std.mem.Allocator,
-    target_host: []const u8,
-    target_port: u16,
-) !*std.http.Client.Connection {
-    const t = try establishProxyTlsTunnel(client, allocator, target_host, target_port);
-    const conn = try allocator.create(std.http.Client.Connection);
-    errdefer allocator.destroy(conn);
-    conn.* = .{
-        .stream = t.stream,
-        .tls_client = t.tls,
-        .protocol = .tls,
-        .host = try allocator.dupe(u8, target_host),
-        .port = target_port,
-        .proxied = true,
-    };
-    return conn;
-}
 
 /// HTTP POST via curl subprocess (most stable for proxy+TLS).
 /// Uses system curl which handles proxy auth, TLS, chunked correctly.
 fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse {
     // Build curl command.
-    var args = std.ArrayList([]const u8).init(allocator);
+    var args = std.array_list.Managed([]const u8).init(allocator);
     defer args.deinit();
     try args.append("curl");
     try args.append("-s");
@@ -558,7 +507,7 @@ fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse 
         try args.append("--data-binary");
         // Write body to temp file to avoid arg length limits.
         const tmp_path = "/tmp/curl_body_tmp.json";
-        const f = try std.fs.cwd().createFile(tmp_path, .{});
+        const f = try sio.cwd().createFile(tmp_path, .{});
         try f.writeAll(body);
         f.close();
         const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{tmp_path});
@@ -571,28 +520,24 @@ fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse 
     try args.append("-o");
     try args.append("-"); // stdout
 
-    var child = std.process.Child.init(args.items, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-
-    var stdout = std.ArrayListUnmanaged(u8){};
-    defer stdout.deinit(allocator);
-    var stderr = std.ArrayListUnmanaged(u8){};
-    defer stderr.deinit(allocator);
-
-    try child.collectOutput(allocator, &stdout, &stderr, 16 * 1024 * 1024);
-    const term = try child.wait();
+    const result = try sio.Child.run(.{
+        .allocator = allocator,
+        .argv = args.items,
+        .max_output_bytes = 16 * 1024 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
     // Clean up temp file.
-    std.fs.cwd().deleteFile("/tmp/curl_body_tmp.json") catch {};
+    sio.cwd().deleteFile("/tmp/curl_body_tmp.json") catch {};
 
-    if (term.Exited != 0) {
-        return error.CurlFailed;
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
     }
 
     // Parse output: body + "\n" + status_code
-    const out = stdout.items;
+    const out = result.stdout;
     const last_nl = std.mem.lastIndexOfScalar(u8, out, '\n') orelse return error.CurlBadOutput;
     const code_str = std.mem.trim(u8, out[last_nl + 1 ..], " \r\n");
     const status = std.fmt.parseInt(u16, code_str, 10) catch return error.CurlBadOutput;
@@ -603,154 +548,6 @@ fn curlHttpPost(allocator: std.mem.Allocator, req: *HttpRequest) !*HttpResponse 
     return try makeStatusResponse(allocator, status, headers, body_copy);
 }
 
-/// Manual HTTP/1.1 request over an established TLS tunnel.
-/// Bypasses std.http.Client entirely for the proxied-HTTPS case.
-fn manualHttpOverTls(
-    allocator: std.mem.Allocator,
-    tls: *std.crypto.tls.Client,
-    stream: std.net.Stream,
-    method: std.http.Method,
-    uri: std.Uri,
-    headers: []const std.http.Header,
-    body: ?[]const u8,
-) !*HttpResponse {
-    const path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
-    // Build request.
-    var req_buf = std.ArrayList(u8).init(allocator);
-    defer req_buf.deinit();
-    const w = req_buf.writer();
-    try w.print("{s} {s} HTTP/1.0\r\n", .{ @tagName(method), path });
-    const host_str = switch (uri.host.?) { .raw => |s| s, .percent_encoded => |s| s };
-    try w.print("Host: {s}\r\n", .{host_str});
-    try w.writeAll("Connection: close\r\n");
-    try w.writeAll("Accept-Encoding: identity\r\n");
-    for (headers) |h| {
-        // Skip Accept-Encoding, we already set it.
-        if (std.ascii.eqlIgnoreCase(h.name, "Accept-Encoding")) continue;
-        try w.print("{s}: {s}\r\n", .{ h.name, h.value });
-    }
-    if (body) |b| {
-        try w.print("Content-Length: {d}\r\n", .{b.len});
-    }
-    try w.writeAll("\r\n");
-    if (body) |b| {
-        try w.writeAll(b);
-    }
-    try tls.writeAll(stream, req_buf.items);
-
-    // Read response headers.
-    var resp_buf = std.ArrayList(u8).init(allocator);
-    defer resp_buf.deinit();
-    var tmp: [8192]u8 = undefined;
-    var header_end: ?usize = null;
-    while (header_end == null) {
-        const n = tls.read(stream, tmp[0..]) catch |err| {
-            return err;
-        };
-        if (n == 0) {
-            return error.HttpResponseEof;
-        }
-        try resp_buf.appendSlice(tmp[0..n]);
-        if (std.mem.indexOf(u8, resp_buf.items, "\r\n\r\n")) |idx| {
-            header_end = idx + 4;
-        }
-        if (resp_buf.items.len > 64 * 1024) return error.HttpHeadersTooLarge;
-    }
-    const he = header_end.?;
-    // Parse status.
-    const status_line_end = std.mem.indexOf(u8, resp_buf.items[0..he], "\r\n") orelse return error.HttpBadResponse;
-    var parts = std.mem.splitScalar(u8, resp_buf.items[0..status_line_end], ' ');
-    _ = parts.next();
-    const code_str = parts.next() orelse return error.HttpBadResponse;
-    const status_code = std.fmt.parseInt(u16, code_str, 10) catch return error.HttpBadResponse;
-    // Parse headers.
-    var resp_headers = std.ArrayList(std.http.Header).init(allocator);
-    errdefer resp_headers.deinit();
-    var hdr_iter = std.mem.splitSequence(u8, resp_buf.items[status_line_end + 2 .. he - 2], "\r\n");
-    var content_length: ?usize = null;
-    var is_chunked = false;
-    while (hdr_iter.next()) |line| {
-        if (line.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " ");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " ");
-        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
-            content_length = std.fmt.parseInt(usize, value, 10) catch null;
-        } else if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.indexOfIgnoreCase(value, "chunked") != null) {
-            is_chunked = true;
-        }
-        try resp_headers.append(.{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, value) });
-    }
-    // Read body.
-    var body_out = std.ArrayList(u8).init(allocator);
-    errdefer body_out.deinit();
-    // Any body bytes already read after headers.
-    if (resp_buf.items.len > he) {
-        try body_out.appendSlice(resp_buf.items[he..]);
-    }
-    // Simplified: read until connection close (we sent Connection: close).
-    // For chunked, read until we see the 0-chunk terminator, then de-chunk.
-    if (is_chunked) {
-        var raw = std.ArrayList(u8).init(allocator);
-        defer raw.deinit();
-        try raw.appendSlice(body_out.items);
-        // Read until we find the chunked terminator "0\r\n\r\n" or "0\r\n" at end.
-        var found_end = false;
-        while (!found_end) {
-            if (std.mem.indexOf(u8, raw.items, "\r\n0\r\n\r\n") != null or
-                std.mem.endsWith(u8, raw.items, "\r\n0\r\n\r\n") or
-                std.mem.endsWith(u8, raw.items, "\r\n0\r\n")) {
-                found_end = true;
-                break;
-            }
-            const n = tls.read(stream, tmp[0..]) catch |err| {
-                return err;
-            };
-            if (n == 0) break; // EOF, try to parse what we have
-            try raw.appendSlice(tmp[0..n]);
-            // Safety: don't read forever
-            if (raw.items.len > 10 * 1024 * 1024) return error.HttpResponseTooLarge;
-        }
-        // De-chunk: parse chunk sizes and extract data.
-        body_out.clearRetainingCapacity();
-        var pos: usize = 0;
-        while (pos < raw.items.len) {
-            const line_end_opt = std.mem.indexOf(u8, raw.items[pos..], "\r\n");
-            if (line_end_opt == null) break;
-            const line_end = line_end_opt.? + pos;
-            const line = raw.items[pos..line_end];
-            const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
-            const chunk_size = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..semi], " "), 16) catch break;
-            pos = line_end + 2;
-            if (chunk_size == 0) break;
-            if (pos + chunk_size > raw.items.len) break;
-            try body_out.appendSlice(raw.items[pos .. pos + chunk_size]);
-            pos += chunk_size + 2; // skip data and trailing CRLF
-        }
-    } else if (content_length) |cl| {
-        while (body_out.items.len < cl) {
-            const n = try tls.read(stream, tmp[0..]);
-            if (n == 0) return error.HttpResponseEof;
-            try body_out.appendSlice(tmp[0..n]);
-        }
-        if (body_out.items.len > cl) {
-            try body_out.resize(cl);
-        }
-    } else {
-        // No Content-Length, not chunked: use buffered data only.
-        // Server should have sent everything with headers (HTTP/1.0).
-    }
-
-    const headers_slice = try resp_headers.toOwnedSlice();
-    errdefer {
-        for (headers_slice) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        allocator.free(headers_slice);
-    }
-    return try makeStatusResponse(allocator, status_code, headers_slice, try body_out.toOwnedSlice());
-}
 
 /// Parse Retry-After header value in delta-seconds. Returns 0 if absent or invalid.
 fn getRetryAfterSecs(headers: []std.http.Header) u64 {
@@ -780,7 +577,7 @@ fn backoffSecs(attempt: u32) u64 {
 /// Single attempt without retry. See httpRequestExec for the retry wrapper.
 fn httpRequestExecOnce(req: *HttpRequest) !*HttpResponse {
     const uri = try std.Uri.parse(req.url);
-    req.client.request_mutex.lock();
+    while (!req.client.request_mutex.tryLock()) std.atomic.spinLoopHint();
     defer req.client.request_mutex.unlock();
     // Save proxies; maybeBypassProxy may clear them for no_proxy hosts.
     const saved_http_proxy = req.client.client.http_proxy;
@@ -799,49 +596,25 @@ fn httpRequestExecOnce(req: *HttpRequest) !*HttpResponse {
         errdefer req.allocator.free(ae_val);
         try req.headers.append(.{ .name = ae_name, .value = ae_val });
     }
-    var header_buf: [16 * 1024]u8 = undefined;
-    if (std.mem.eql(u8, uri.scheme, "https") and req.client.client.https_proxy != null) {
-        const target_port = uri.port orelse 443;
-        const target_host = uri.host orelse return error.InvalidUri;
-        const host_str = switch (target_host) {
-            .raw => |s| s,
-            .percent_encoded => |s| s,
-        };
-        // For proxy+TLS, try curl first (most stable), fallback to manual.
-        // Outer if already ensured https + proxy, so just try curl.
-        if (curlHttpPost(req.allocator, req)) |resp| {
-            return resp;
-        } else |_| {
-            // Fallback to manual on curl failure.
-        }
-        // Manual path: tunnel + TLS + raw HTTP/1.0, bypassing std.http.Client.
-        const t = try establishProxyTlsTunnel(&req.client.client, req.allocator, host_str, target_port);
-        defer {
-            req.allocator.destroy(t.tls);
-            t.stream.close();
-        }
-        return try manualHttpOverTls(req.allocator, t.tls, t.stream, req.method, uri, req.headers.items, req.body);
-    }
-    var request = try req.client.client.open(req.method, uri, .{
-        .server_header_buffer = &header_buf,
+    // NOTE(Zig 0.17): proxy CONNECT tunnels + TLS are handled natively by
+    // std.http.Client (see HttpClient.init -> initDefaultProxies); the manual
+    // tunnel path was removed.
+    var redirect_buf: [16 * 1024]u8 = undefined;
+    var request = try req.client.client.request(req.method, uri, .{
         .keep_alive = false,
-        .headers = .{},
+        .redirect_behavior = .unhandled,
         .extra_headers = req.headers.items,
     });
     defer request.deinit();
-
-    request.transfer_encoding = if (req.body) |body| .{ .content_length = body.len } else .none;
-    try request.send();
     if (req.body) |body| {
-        try request.writeAll(body);
+        const owned_body = try req.allocator.dupe(u8, body);
+        defer req.allocator.free(owned_body);
+        try request.sendBodyComplete(owned_body);
+    } else {
+        try request.sendBodiless();
     }
-    try request.finish();
-    try request.wait();
-
-    var body = std.ArrayList(u8).init(req.allocator);
-    errdefer body.deinit();
-    try request.reader().readAllArrayList(&body, 16 * 1024 * 1024);
-    const headers = try cloneResponseHeaders(req.allocator, request.response);
+    var response = try request.receiveHead(&redirect_buf);
+    const headers = try cloneResponseHeaders(req.allocator, response);
     errdefer {
         for (headers) |header| {
             req.allocator.free(header.name);
@@ -849,7 +622,20 @@ fn httpRequestExecOnce(req: *HttpRequest) !*HttpResponse {
         }
         req.allocator.free(headers);
     }
-    return try makeStatusResponse(req.allocator, mapStatus(request.response.status), headers, try body.toOwnedSlice());
+    var body = std.array_list.Managed(u8).init(req.allocator);
+    errdefer body.deinit();
+    var transfer_buf: [8192]u8 = undefined;
+    var body_reader = response.reader(&transfer_buf);
+    var read_buf: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try body_reader.readSliceShort(&read_buf);
+        if (n == 0) break;
+        total += n;
+        if (total > 16 * 1024 * 1024) return error.StreamTooLong;
+        try body.appendSlice(read_buf[0..n]);
+    }
+    return try makeStatusResponse(req.allocator, mapStatus(response.head.status), headers, try body.toOwnedSlice());
 }
 
 /// Retry wrapper: up to 5 retries (6 attempts total) on 429 / 5xx /
@@ -861,7 +647,7 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
     while (true) {
         const resp = httpRequestExecOnce(req) catch |err| {
             if (attempt < max_retries) {
-                std.time.sleep(backoffSecs(attempt) * std.time.ns_per_s);
+                sio.io().sleep(.fromNanoseconds(backoffSecs(attempt) * std.time.ns_per_s), .awake) catch {};
                 attempt += 1;
                 continue;
             }
@@ -872,13 +658,13 @@ fn httpRequestExec(req: *HttpRequest) !*HttpResponse {
         }
         const wait_secs = @max(backoffSecs(attempt), getRetryAfterSecs(resp.headers));
         resp.deinit();
-        std.time.sleep(wait_secs * std.time.ns_per_s);
+        sio.io().sleep(.fromNanoseconds(wait_secs * std.time.ns_per_s), .awake) catch {};
         attempt += 1;
     }
 }
 
-fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.ArrayList(u8) {
-    var out = std.ArrayList(u8).init(allocator);
+fn readAllIntoList(reader: anytype, allocator: std.mem.Allocator) !std.array_list.Managed(u8) {
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var buf: [1024]u8 = undefined;
     while (true) {
@@ -1122,42 +908,84 @@ const WebSocketOpcode = enum(u8) {
 
 const WebSocketHandle = struct {
     allocator: std.mem.Allocator,
-    stream: ?std.net.Stream = null,
+    stream: ?std.Io.net.Stream = null,
+    // TLS state for wss://. The net reader/writer (and their buffers) must
+    // outlive tls_client, which borrows them; all live in the handle.
+    tls_client: ?*std.crypto.tls.Client = null,
+    net_reader: std.Io.net.Stream.Reader = undefined,
+    net_writer: std.Io.net.Stream.Writer = undefined,
+    net_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    net_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    // Persistent buffered reader for plain (non-TLS) frame reads. A fresh
+    // reader per read would over-read past frame boundaries and lose bytes.
+    frame_reader: std.Io.net.Stream.Reader = undefined,
+    frame_read_buf: [8192]u8 = undefined,
+    tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    ca_lock: std.Io.RwLock = .init,
 
     fn isClient(self: *WebSocketHandle) bool {
         _ = self;
         return true;
     }
 
+    fn rawRead(self: *WebSocketHandle, buffer: []u8) !usize {
+        if (self.tls_client) |t| {
+            return try t.reader.readSliceShort(buffer);
+        }
+        return try self.frame_reader.interface.readSliceShort(buffer);
+    }
+
+    fn rawWrite(self: *WebSocketHandle, bytes: []const u8) !void {
+        if (self.tls_client) |t| {
+            try t.writer.writeAll(bytes);
+            try t.writer.flush();
+            return;
+        }
+        const stream = self.stream orelse return error.EndOfStream;
+        var wbuf: [8192]u8 = undefined;
+        var w = stream.writer(sio.io(), &wbuf);
+        try w.interface.writeAll(bytes);
+        try w.interface.flush();
+    }
+
     fn readExact(self: *WebSocketHandle, buffer: []u8) bool {
-        const stream = self.stream orelse return false;
-        var index: usize = 0;
-        while (index < buffer.len) {
-            const read_n = stream.read(buffer[index..]) catch return false;
-            if (read_n == 0) return false;
-            index += read_n;
+        var offset: usize = 0;
+        while (offset < buffer.len) {
+            const n = self.rawRead(buffer[offset..]) catch return false;
+            if (n == 0) return false;
+            offset += n;
         }
         return true;
     }
 
     fn writeExact(self: *WebSocketHandle, bytes: []const u8) bool {
-        const stream = self.stream orelse return false;
-        stream.writeAll(bytes) catch return false;
+        self.rawWrite(bytes) catch return false;
         return true;
     }
 
     fn deinit(self: *WebSocketHandle) void {
+        if (self.tls_client) |t| {
+            self.allocator.destroy(t);
+            self.tls_client = null;
+        }
         if (self.stream) |stream| {
-            stream.close();
+            stream.close(sio.io());
+            self.stream = null;
         }
         self.allocator.destroy(self);
     }
 };
 
-fn websocketResponseHeader(response: *std.http.Client.Response, key: []const u8) ?[]const u8 {
-    var it = response.iterateHeaders();
-    while (it.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, key)) return header.value;
+fn findRawHeader(head: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), key)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
     }
     return null;
 }
@@ -1174,7 +1002,7 @@ fn websocketWriteFrame(handle: *WebSocketHandle, opcode: u8, payload: []const u8
     const masked = handle.isClient();
     var mask_key: [4]u8 = undefined;
     const mask = if (masked) blk: {
-        std.crypto.random.bytes(&mask_key);
+        sio.io().random(&mask_key);
         break :blk &mask_key;
     } else null;
     const frame_cap = std.math.add(usize, payload.len, 14) catch return false;
@@ -1197,8 +1025,12 @@ fn websocketReadFrame(handle: *WebSocketHandle, max_len: u64, out_opcode: ?*u8, 
     const len_slot = out_len orelse return fail();
 
     while (true) {
-        const stream = handle.stream orelse return fail();
-        const frame = sa_std_net.readWebSocketFrameAlloc(handle.allocator, stream, max_len, !handle.isClient()) catch return fail();
+        if (handle.stream == null and handle.tls_client == null) return fail();
+        const reader: *std.Io.Reader = if (handle.tls_client) |t|
+            &t.reader
+        else
+            &handle.frame_reader.interface;
+        const frame = sa_std_net.readWebSocketFrameAlloc(handle.allocator, reader, max_len, !handle.isClient()) catch return fail();
         const opcode = frame.opcode;
         const payload = frame.payload;
 
@@ -1263,87 +1095,116 @@ pub export fn sa_http_client_websocket_connect(client: ?*anyopaque, url_ptr: ?[*
     const url_slice = url[0..@intCast(url_len)];
     const uri = std.Uri.parse(url_slice) catch return fail();
 
-    var request_headers: [3]std.http.Header = .{
-        .{ .name = "upgrade", .value = "websocket" },
-        .{ .name = "sec-websocket-version", .value = "13" },
-        undefined,
+    const host_slice = switch (uri.host orelse return fail()) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
     };
+    const use_tls = std.mem.eql(u8, uri.scheme, "wss") or std.mem.eql(u8, uri.scheme, "https");
+    if (!use_tls and !std.mem.eql(u8, uri.scheme, "ws") and !std.mem.eql(u8, uri.scheme, "http")) return fail();
+    const port: u16 = uri.port orelse if (use_tls) 443 else 80;
+
+    // Request target: path + optional query.
+    var target_buf: [8192]u8 = undefined;
+    var target_stream = std.Io.Writer.fixed(&target_buf);
+    const raw_path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    target_stream.print("{s}", .{raw_path}) catch return fail();
+    if (uri.query) |q| {
+        const qs = switch (q) {
+            .raw => |s| s,
+            .percent_encoded => |s| s,
+        };
+        target_stream.print("?{s}", .{qs}) catch return fail();
+    }
+    const target = target_stream.buffer[0..target_stream.end];
 
     var key_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&key_bytes);
+    sio.io().random(&key_bytes);
     var key_b64: [24]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&key_b64, &key_bytes);
-    request_headers[2] = .{ .name = "sec-websocket-key", .value = key };
 
-    var header_buf: [16 * 1024]u8 = undefined;
-    var req = cli.client.open(.GET, uri, .{
-        .server_header_buffer = &header_buf,
-        .headers = .{
-            .connection = .{ .override = "Upgrade" },
-            .user_agent = .omit,
-            .accept_encoding = .omit,
-        },
-        .extra_headers = &request_headers,
-        .keep_alive = true,
-    }) catch return fail();
-    defer req.deinit();
+    var stream = dialHost(host_slice, port) catch return fail();
+    errdefer stream.close(sio.io());
 
-    req.transfer_encoding = .none;
-    req.send() catch return fail();
-    req.finish() catch return fail();
-    req.wait() catch return fail();
-
-    if (req.response.status != .switching_protocols) {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
-    }
-
-    const upgrade = websocketResponseHeader(&req.response, "upgrade") orelse {
-        if (req.connection) |connection| connection.closing = true;
+    const handle = cli.allocator.create(WebSocketHandle) catch {
+        stream.close(sio.io());
         return fail();
     };
-    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
+    errdefer handle.deinit();
+    handle.* = .{ .allocator = cli.allocator, .stream = stream };
+    handle.frame_reader = stream.reader(sio.io(), &handle.frame_read_buf);
+
+    if (use_tls) {
+        // TLS handshake over the raw stream (wss://).
+        handle.net_reader = stream.reader(sio.io(), &handle.net_read_buf);
+        handle.net_writer = stream.writer(sio.io(), &handle.net_write_buf);
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        sio.io().random(&entropy);
+        const tls_client = cli.allocator.create(std.crypto.tls.Client) catch return fail();
+        errdefer cli.allocator.destroy(tls_client);
+        tls_client.* = std.crypto.tls.Client.init(
+            &handle.net_reader.interface,
+            &handle.net_writer.interface,
+            .{
+                .host = .{ .explicit = host_slice },
+                .ca = .{ .bundle = .{
+                    .gpa = cli.allocator,
+                    .io = sio.io(),
+                    .lock = &handle.ca_lock,
+                    .bundle = &cli.client.ca_bundle,
+                } },
+                .write_buffer = &handle.tls_write_buf,
+                .read_buffer = &handle.tls_read_buf,
+                .entropy = &entropy,
+                .realtime_now = std.Io.Clock.real.now(sio.io()),
+            },
+        ) catch return fail();
+        handle.tls_client = tls_client;
     }
 
-    const connection_value = websocketResponseHeader(&req.response, "connection") orelse {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
-    };
-    if (!websocketHeaderContainsToken(connection_value, "upgrade")) {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
+    // Send upgrade request.
+    var req_buf = std.array_list.Managed(u8).init(cli.allocator);
+    defer req_buf.deinit();
+    req_buf.print("GET {s} HTTP/1.1\r\n", .{target}) catch return fail();
+    if (port == 80 or port == 443) {
+        req_buf.print("Host: {s}\r\n", .{host_slice}) catch return fail();
+    } else {
+        req_buf.print("Host: {s}:{d}\r\n", .{ host_slice, port }) catch return fail();
     }
+    req_buf.appendSlice("Connection: Upgrade\r\nUpgrade: websocket\r\nsec-websocket-version: 13\r\n") catch return fail();
+    req_buf.print("sec-websocket-key: {s}\r\n\r\n", .{key}) catch return fail();
+    if (!handle.writeExact(req_buf.items)) return fail();
 
-    const accept_value = websocketResponseHeader(&req.response, "sec-websocket-accept") orelse {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
-    };
+    // Read response head.
+    var head_buf = std.array_list.Managed(u8).init(cli.allocator);
+    defer head_buf.deinit();
+    var tmp: [4096]u8 = undefined;
+    var head_end: ?usize = null;
+    while (head_end == null) {
+        const n = handle.rawRead(&tmp) catch return fail();
+        if (n == 0) return fail();
+        head_buf.appendSlice(tmp[0..n]) catch return fail();
+        if (head_buf.items.len > 64 * 1024) return fail();
+        if (std.mem.indexOf(u8, head_buf.items, "\r\n\r\n")) |idx| head_end = idx;
+    }
+    const head = head_buf.items[0..head_end.?];
+    {
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        const status_line = lines.next() orelse return fail();
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next();
+        const code_str = parts.next() orelse return fail();
+        const code = std.fmt.parseInt(u16, code_str, 10) catch return fail();
+        if (code != 101) return fail();
+    }
+    const upgrade = findRawHeader(head, "upgrade") orelse return fail();
+    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return fail();
+    const connection_value = findRawHeader(head, "connection") orelse return fail();
+    if (!websocketHeaderContainsToken(connection_value, "upgrade")) return fail();
+    const accept_value = findRawHeader(head, "sec-websocket-accept") orelse return fail();
     var expected_accept_buf: [28]u8 = undefined;
-    const expected_accept = sa_std_net.websocketAccept(key, &expected_accept_buf) catch {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
-    };
-    if (!std.mem.eql(u8, accept_value, expected_accept)) {
-        if (req.connection) |connection| connection.closing = true;
-        return fail();
-    }
+    const expected_accept = sa_std_net.websocketAccept(key, &expected_accept_buf) catch return fail();
+    if (!std.mem.eql(u8, accept_value, expected_accept)) return fail();
 
-    const connection = req.connection orelse {
-        return fail();
-    };
-    const duplicated_handle = std.posix.dup(connection.stream.handle) catch return fail();
-    const duplicated_stream = std.net.Stream{ .handle = duplicated_handle };
-
-    const handle = cli.allocator.create(WebSocketHandle) catch return fail();
-    req.connection = null;
-    req.deinit();
-
-    handle.* = .{
-        .allocator = cli.allocator,
-        .stream = duplicated_stream,
-    };
     slot.* = @ptrCast(handle);
     return 0;
 }
@@ -1356,7 +1217,7 @@ var sse_stream_counter = std.atomic.Value(u64).init(0);
 
 const SseStream = struct {
     allocator: std.mem.Allocator,
-    child: std.process.Child,
+    child: sio.Child,
     body_path: []u8,
     header_path: []u8,
     req_body_path: []u8,
@@ -1373,7 +1234,7 @@ fn sseTempPath(allocator: std.mem.Allocator, suffix: []const u8) ![]u8 {
 }
 
 fn sseParseStatus(header_path: []const u8) u16 {
-    const f = std.fs.cwd().openFile(header_path, .{}) catch return 0;
+    const f = sio.cwd().openFile(header_path, .{}) catch return 0;
     defer f.close();
     var buf: [256]u8 = undefined;
     const n = f.read(&buf) catch return 0;
@@ -1382,14 +1243,14 @@ fn sseParseStatus(header_path: []const u8) u16 {
     const line = buf[0..line_end];
     // Find first space, then parse the number after it.
     const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return 0;
-    const rest = std.mem.trimLeft(u8, line[sp + 1 ..], " ");
+    const rest = std.mem.trimStart(u8, line[sp + 1 ..], " ");
     const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return std.fmt.parseInt(u16, rest[0..sp2], 10) catch 0;
 }
 
 /// Parse Retry-After from SSE header file. Returns 0 if absent/invalid. Capped at 300s.
 fn sseParseRetryAfter(header_path: []const u8) u64 {
-    const f = std.fs.cwd().openFile(header_path, .{}) catch return 0;
+    const f = sio.cwd().openFile(header_path, .{}) catch return 0;
     defer f.close();
     var buf: [4096]u8 = undefined;
     const n = f.read(&buf) catch return 0;
@@ -1408,13 +1269,24 @@ fn sseParseRetryAfter(header_path: []const u8) u64 {
 
 fn sseCheckFinished(s: *SseStream) void {
     if (s.finished) return;
-    const res = std.posix.waitpid(s.child.id, std.posix.W.NOHANG);
-    if (res.pid == 0) return; // still running
+    // NOTE(Zig 0.17): `std.posix.waitpid` was removed; poll via raw Linux
+    // wait4 with WNOHANG (curl SSE path is Linux-only in practice).
+    if (builtin.os.tag != .linux) return;
+    const inner = &(s.child.inner orelse return);
+    const pid = inner.id orelse return;
+    var status: i32 = 0;
+    const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
+    if (rc == 0) return; // still running
     s.finished = true;
-    if (std.posix.W.IFEXITED(res.status)) {
-        s.failed = std.posix.W.EXITSTATUS(res.status) != 0;
+    if (@as(isize, @bitCast(rc)) < 0) {
+        s.failed = true; // wait error (e.g. no child)
     } else {
-        s.failed = true; // signaled or stopped
+        const st: u32 = @bitCast(status);
+        if (std.os.linux.W.IFEXITED(st)) {
+            s.failed = std.os.linux.W.EXITSTATUS(st) != 0;
+        } else {
+            s.failed = true; // signaled or stopped
+        }
     }
     s.http_status = sseParseStatus(s.header_path);
 }
@@ -1438,14 +1310,14 @@ pub export fn sa_http_client_sse_post(
 
     // Write request body to temp file.
     {
-        const f = std.fs.cwd().createFile(req_body_path, .{}) catch return 1;
+        const f = sio.cwd().createFile(req_body_path, .{}) catch return 1;
         defer f.close();
         if (body_ptr) |p| {
             f.writeAll(p[0..body_len]) catch return 1;
         }
     }
 
-    var args = std.ArrayList([]const u8).init(allocator);
+    var args = std.array_list.Managed([]const u8).init(allocator);
     defer args.deinit();
     args.append("curl") catch return 1;
     args.append("-s") catch return 1;
@@ -1476,14 +1348,14 @@ pub export fn sa_http_client_sse_post(
     args.append("-o") catch return 1;
     args.append(body_path) catch return 1;
 
-    var child = std.process.Child.init(args.items, allocator);
+    var child = sio.Child.init(args.items, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return 1;
 
     const s = allocator.create(SseStream) catch {
-        _ = child.kill() catch unreachable;
+        child.kill() catch {};
         _ = child.wait() catch {};
         return 1;
     };
@@ -1513,7 +1385,7 @@ pub export fn sa_http_client_sse_read(
     out.* = 0;
     if (buf_cap == 0) return 0;
 
-    const f = std.fs.cwd().openFile(s.body_path, .{}) catch return 0;
+    const f = sio.cwd().openFile(s.body_path, .{}) catch return 0;
     defer f.close();
     const st = f.stat() catch return 0;
     if (st.size <= s.read_offset) return 0;
@@ -1552,9 +1424,9 @@ pub export fn sa_http_client_sse_free(handle: ?*anyopaque) u32 {
         _ = s.child.kill() catch {};
         _ = s.child.wait() catch {};
     }
-    std.fs.cwd().deleteFile(s.body_path) catch {};
-    std.fs.cwd().deleteFile(s.header_path) catch {};
-    std.fs.cwd().deleteFile(s.req_body_path) catch {};
+    sio.cwd().deleteFile(s.body_path) catch {};
+    sio.cwd().deleteFile(s.header_path) catch {};
+    sio.cwd().deleteFile(s.req_body_path) catch {};
     s.allocator.free(s.body_path);
     s.allocator.free(s.header_path);
     s.allocator.free(s.req_body_path);
@@ -1593,7 +1465,7 @@ pub export fn sa_http_client_sse_turn(
         if (sa_http_client_sse_post(url_ptr, url_len, body_ptr, body_len, key_ptr, key_len, &handle) != 0 or handle == null) {
             if (handle) |h| _ = sa_http_client_sse_free(h);
             if (attempt < 5) {
-                std.time.sleep(backoffSecs(attempt) * std.time.ns_per_s);
+                sio.io().sleep(.fromNanoseconds(backoffSecs(attempt) * std.time.ns_per_s), .awake) catch {};
                 attempt += 1;
                 continue;
             }
@@ -1611,7 +1483,7 @@ pub export fn sa_http_client_sse_turn(
             var done: u8 = 0;
             _ = sa_http_client_sse_poll(handle, &done);
             if (done != 0) break;
-            std.time.sleep(50 * std.time.ns_per_ms);
+            sio.io().sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
         }
         if (status == 200) {
             // Success: stream to completion. sseTurnStream does not free handle;
@@ -1625,7 +1497,7 @@ pub export fn sa_http_client_sse_turn(
         _ = sa_http_client_sse_free(handle);
         if (status != 0 and isRetryableStatus(status) and attempt < 5) {
             const wait_secs = @max(backoffSecs(attempt), retry_after);
-            std.time.sleep(wait_secs * std.time.ns_per_s);
+            sio.io().sleep(.fromNanoseconds(wait_secs * std.time.ns_per_s), .awake) catch {};
             attempt += 1;
             continue;
         }
@@ -1643,9 +1515,9 @@ fn sseTurnStream(
     const allocator = std.heap.page_allocator;
     const s = @as(*SseStream, @ptrCast(@alignCast(handle.?)));
 
-    var text = std.ArrayList(u8).init(allocator);
+    var text = std.array_list.Managed(u8).init(allocator);
     defer text.deinit();
-    var calls = std.ArrayList(SseCall).init(allocator);
+    var calls = std.array_list.Managed(SseCall).init(allocator);
     defer {
         for (calls.items) |*c| {
             if (c.call_id.len > 0) allocator.free(c.call_id);
@@ -1655,7 +1527,7 @@ fn sseTurnStream(
         }
         calls.deinit();
     }
-    var active = std.ArrayList(SseCall).init(allocator);
+    var active = std.array_list.Managed(SseCall).init(allocator);
     defer {
         // Free any remaining active calls.
         for (active.items) |*ac| {
@@ -1668,11 +1540,14 @@ fn sseTurnStream(
     }
     var stream_done = false;
 
-    var buf = std.ArrayList(u8).init(allocator);
+    var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
     var processed_offset: usize = 0;
 
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout_stream = std.Io.File.stdout().writerStreaming(sio.io(), &stdout_buf);
+    const stdout = &stdout_stream.interface;
+    defer stdout_stream.interface.flush() catch {};
 
     // Main read loop.
     while (!stream_done) {
@@ -1723,7 +1598,7 @@ fn sseTurnStream(
             return 2;
         }
         if (new_data.len == 0) {
-            std.time.sleep(20 * std.time.ns_per_ms);
+            sio.io().sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
         }
     }
 
@@ -1734,17 +1609,17 @@ fn sseTurnStream(
     stdout.writeAll("\n") catch {};
 
     // Build calls JSON first (so text isn't leaked on failure).
-    var calls_json = std.ArrayList(u8).init(allocator);
+    var calls_json = std.array_list.Managed(u8).init(allocator);
     defer calls_json.deinit();
     calls_json.appendSlice("[") catch return 2;
     for (calls.items, 0..) |c, i| {
         if (i > 0) calls_json.appendSlice(",") catch return 2;
         calls_json.appendSlice("{\"call_id\":\"") catch return 2;
-        sseJsonEscape(calls_json.writer(), c.call_id) catch return 2;
+        sseJsonEscape(&calls_json, c.call_id) catch return 2;
         calls_json.appendSlice("\",\"name\":\"") catch return 2;
-        sseJsonEscape(calls_json.writer(), c.name) catch return 2;
+        sseJsonEscape(&calls_json, c.name) catch return 2;
         calls_json.appendSlice("\",\"args\":\"") catch return 2;
-        sseJsonEscape(calls_json.writer(), c.args) catch return 2;
+        sseJsonEscape(&calls_json, c.args) catch return 2;
         calls_json.appendSlice("\"}") catch return 2;
     }
     calls_json.appendSlice("]") catch return 2;
@@ -1782,7 +1657,7 @@ const SseEventData = struct {
 };
 
 fn sseReadNew(s: *SseStream, offset: *usize) ![]u8 {
-    const f = std.fs.cwd().openFile(s.body_path, .{}) catch |err| {
+    const f = sio.cwd().openFile(s.body_path, .{}) catch |err| {
         // File not yet created by curl; treat as no new data.
         if (err == error.FileNotFound) {
             return try s.allocator.alloc(u8, 0);
@@ -1797,7 +1672,12 @@ fn sseReadNew(s: *SseStream, offset: *usize) ![]u8 {
     var data = try s.allocator.alloc(u8, len);
     errdefer s.allocator.free(data);
     try f.seekTo(offset.*);
-    const n = try f.readAll(data);
+    var n: usize = 0;
+    while (n < data.len) {
+        const m = try f.read(data[n..]);
+        if (m == 0) break;
+        n += m;
+    }
     offset.* += n;
     // Shrink to actual bytes read so free() gets the right size.
     if (n < len) {
@@ -1819,7 +1699,7 @@ fn sseFindEventEnd(data: []const u8) ?SseDelim {
 
 fn sseParseEventData(allocator: std.mem.Allocator, ev: []const u8) ?SseEventData {
     // SSE spec: multiple "data:" lines are joined with "\n".
-    var parts = std.ArrayList([]const u8).init(allocator);
+    var parts = std.array_list.Managed([]const u8).init(allocator);
     defer parts.deinit();
     var is_done = false;
     var lines = std.mem.splitScalar(u8, ev, '\n');
@@ -1848,9 +1728,9 @@ fn sseHandleEvent(
     allocator: std.mem.Allocator,
     data: []const u8,
     api_mode: u64,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {
@@ -1865,7 +1745,7 @@ fn sseHandleEvent(
 }
 
 // Find an active call by key (call_id for responses, index string for chat).
-fn sseFindActive(active: *std.ArrayList(SseCall), key: []const u8) ?*SseCall {
+fn sseFindActive(active: *std.array_list.Managed(SseCall), key: []const u8) ?*SseCall {
     for (active.items) |*ac| {
         if (std.mem.eql(u8, ac.key, key)) return ac;
     }
@@ -1873,7 +1753,7 @@ fn sseFindActive(active: *std.ArrayList(SseCall), key: []const u8) ?*SseCall {
 }
 
 // Move all active calls to the completed list (finalize).
-fn sseFinalizeActive(allocator: std.mem.Allocator, active: *std.ArrayList(SseCall), calls: *std.ArrayList(SseCall)) !void {
+fn sseFinalizeActive(allocator: std.mem.Allocator, active: *std.array_list.Managed(SseCall), calls: *std.array_list.Managed(SseCall)) !void {
     for (active.items) |*ac| {
         if (ac.name.len > 0) {
             try calls.append(ac.*);
@@ -1897,9 +1777,9 @@ fn sseJsonStr(val: std.json.Value) ?[]const u8 {
 fn sseHandleResponsesEvent(
     allocator: std.mem.Allocator,
     root: std.json.Value,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {
@@ -1988,9 +1868,9 @@ fn sseHandleResponsesEvent(
 fn sseHandleChatEvent(
     allocator: std.mem.Allocator,
     root: std.json.Value,
-    text: *std.ArrayList(u8),
-    calls: *std.ArrayList(SseCall),
-    active: *std.ArrayList(SseCall),
+    text: *std.array_list.Managed(u8),
+    calls: *std.array_list.Managed(SseCall),
+    active: *std.array_list.Managed(SseCall),
     stream_done: *bool,
     stdout: anytype,
 ) !void {
@@ -2084,15 +1964,15 @@ fn sseHandleChatEvent(
     }
 }
 
-fn sseJsonEscape(writer: anytype, s: []const u8) !void {
+fn sseJsonEscape(out: *std.array_list.Managed(u8), s: []const u8) !void {
     for (s) |ch| {
         switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => try writer.writeByte(ch),
+            '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
+            '\n' => try out.appendSlice("\\n"),
+            '\r' => try out.appendSlice("\\r"),
+            '\t' => try out.appendSlice("\\t"),
+            else => try out.append(ch),
         }
     }
 }

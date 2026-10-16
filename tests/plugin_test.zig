@@ -3,7 +3,7 @@ const plugin = @import("plugin");
 const plugin_api = @import("plugin_api.zig");
 
 const CaptureStream = struct {
-    buffer: *std.ArrayList(u8),
+    buffer: *std.array_list.Managed(u8),
 };
 
 fn captureWriteAll(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) u32 {
@@ -70,9 +70,9 @@ fn spawnLoopbackServer(allocator: std.mem.Allocator, body: []const u8) !struct {
 
 test "http client plugin abi maps missing get URL to cli diagnostic" {
     var ctx = plugin_api.Context{ .allocator = std.testing.allocator };
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
     var stdout_ctx = CaptureStream{ .buffer = &stdout_buf };
     var stderr_ctx = CaptureStream{ .buffer = &stderr_buf };
@@ -108,9 +108,9 @@ test "http client plugin exports runtime descriptor and loopback GET works" {
 
     const loopback = try spawnLoopbackServer(std.testing.allocator, "hello from loopback");
 
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/hello", .{loopback.server.listen_address.getPort()});
@@ -328,9 +328,9 @@ test "http client saasm async request poll and take response" {
 }
 
 test "http client plugin stream command forwards chunked SSE body incrementally" {
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 0);
@@ -396,9 +396,9 @@ test "http client plugin custom CA bundle path is accepted by parser" {
 }
 
 test "http client plugin post command forwards headers and body" {
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 0);
@@ -469,9 +469,9 @@ test "http client plugin post command forwards headers and body" {
 test "http client plugin https ca bundle works against a local self-signed server" {
     if (std.http.Client.disable_tls) return error.SkipZigTest;
 
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
 
     var tmp = std.testing.tmpDir(.{ .iterate = true });

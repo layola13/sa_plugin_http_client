@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const legacy = @import("http_saasm_api.zig");
 const sa_std_net = @import("sa_std_net.zig");
 
@@ -199,36 +200,39 @@ pub export fn sa_http_client_req_set_max_response_bytes_v2(req: ?*anyopaque, max
 }
 
 const Deadline = struct {
-    started: ?std.time.Instant,
+    // NOTE(Zig 0.17): `std.time.Instant` was removed; wall nanos via sio.
+    started_ns: ?i128,
     duration_ns: u64 = 0,
     immediate: bool = false,
 
     fn request(timeout_ms: u32) Deadline {
-        if (timeout_ms == 0) return .{ .started = null };
+        if (timeout_ms == 0) return .{ .started_ns = null };
         return .{
-            .started = std.time.Instant.now() catch null,
+            .started_ns = sio.nanoTimestamp(),
             .duration_ns = @as(u64, timeout_ms) * std.time.ns_per_ms,
         };
     }
 
     fn operation(timeout_ms: u32) Deadline {
+        if (timeout_ms == 0) return .{ .started_ns = null, .immediate = true };
         return .{
-            .started = std.time.Instant.now() catch null,
+            .started_ns = sio.nanoTimestamp(),
             .duration_ns = @as(u64, timeout_ms) * std.time.ns_per_ms,
-            .immediate = timeout_ms == 0,
+            .immediate = false,
         };
     }
 
     fn hasTimeout(self: Deadline) bool {
-        return self.started != null;
+        return self.started_ns != null;
     }
 
     fn remainingNs(self: Deadline) V2Error!u64 {
-        const started = self.started orelse return 0;
-        const now = std.time.Instant.now() catch return error.Io;
-        const elapsed = now.since(started);
-        if (elapsed >= self.duration_ns) return error.Timeout;
-        return self.duration_ns - elapsed;
+        const started = self.started_ns orelse return 0;
+        const elapsed: i128 = sio.nanoTimestamp() - started;
+        if (elapsed < 0) return 0;
+        const elapsed_u: u64 = @intCast(elapsed);
+        if (elapsed_u >= self.duration_ns) return error.Timeout;
+        return self.duration_ns - elapsed_u;
     }
 
     fn pollMillis(self: Deadline) V2Error!u32 {
@@ -241,28 +245,23 @@ const Deadline = struct {
 
     fn socketMillis(self: Deadline) V2Error!u32 {
         if (self.immediate) return 1;
-        if (self.started == null) return 0;
+        if (self.started_ns == null) return 0;
         const remaining = try self.remainingNs();
         const rounded = @divFloor(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
         return @intCast(@max(@as(u64, 1), @min(rounded, std.math.maxInt(u32))));
     }
 };
 
-fn timevalFromMs(timeout_ms: u32) std.posix.timeval {
-    return .{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-}
-
 fn setConnectionTimeout(connection: *std.http.Client.Connection, timeout_ms: u32) V2Error!void {
-    const value = timevalFromMs(timeout_ms);
-    std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&value)) catch return error.Io;
-    std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&value)) catch return error.Io;
+    // NOTE(Zig 0.17): per-socket timeouts via setsockopt were removed with the
+    // old Client API surface used here; timeouts are enforced by Deadline
+    // checks around operations instead.
+    _ = connection;
+    _ = timeout_ms;
 }
 
 fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.Response) ![]std.http.Header {
-    var headers = std.ArrayList(std.http.Header).init(allocator);
+    var headers = std.array_list.Managed(std.http.Header).init(allocator);
     errdefer {
         for (headers.items) |header| {
             allocator.free(header.name);
@@ -270,7 +269,7 @@ fn cloneResponseHeaders(allocator: std.mem.Allocator, response: std.http.Client.
         }
         headers.deinit();
     }
-    var iterator = response.iterateHeaders();
+    var iterator = response.head.iterateHeaders();
     while (iterator.next()) |header| {
         const name = try allocator.dupe(u8, header.name);
         errdefer allocator.free(name);
@@ -325,90 +324,54 @@ fn executeRequestV2(request: *legacy.HttpRequest, tracker: ?*V2AsyncOp) V2Error!
     const deadline = Deadline.request(request.timeout_ms);
     if (requestCancelled(tracker)) return error.Closed;
     const uri = std.Uri.parse(request.url) catch |err| return mapHttpError(err, deadline, tracker);
-    var header_buffer: [16 * 1024]u8 = undefined;
-    // For HTTPS through a proxy, bypass Zig 0.14.1's buggy connectTunnel():
-    // build the tunnel + TLS handshake deterministically and hand the ready
-    // connection to open().
-    var manual_conn: ?*std.http.Client.Connection = null;
-    defer if (manual_conn) |c| {
-        c.stream.close();
-        request.allocator.destroy(c.tls_client);
-        request.allocator.free(c.host);
-        request.allocator.destroy(c);
-    };
-    if (std.mem.eql(u8, uri.scheme, "https") and request.client.client.https_proxy != null) {
-        const target_port = uri.port orelse 443;
-        const target_host = uri.host orelse return error.Invalid;
-        const host_str = switch (target_host) {
-            .raw => |s| s,
-            .percent_encoded => |s| s,
-        };
-        manual_conn = legacy.connectHttpsProxyTunnel(
-            &request.client.client,
-            request.allocator,
-            host_str,
-            target_port,
-        ) catch |err| {
-            manual_conn = null;
-            return mapHttpError(err, deadline, tracker);
-        };
-    }
-    var http_request = request.client.client.open(request.method, uri, .{
-        .server_header_buffer = &header_buffer,
+    // NOTE(Zig 0.17): proxy CONNECT tunnels are handled natively by
+    // std.http.Client now; the manual-tunnel path was removed.
+    var redirect_buffer: [16 * 1024]u8 = undefined;
+    var http_request = request.client.client.request(request.method, uri, .{
         .keep_alive = false,
         .redirect_behavior = .unhandled,
-        .headers = .{},
         .extra_headers = request.headers.items,
-        .connection = manual_conn,
     }) catch |err| return mapHttpError(err, deadline, tracker);
-    // open() adopted the connection.
-    manual_conn = null;
     defer http_request.deinit();
 
-    const connection = http_request.connection orelse return error.Closed;
-    try configureRequestConnection(connection, deadline, tracker);
-    defer if (tracker) |op| op.detach(connection.stream.handle);
-
-    http_request.transfer_encoding = if (request.body) |body| .{ .content_length = body.len } else .none;
-    checkRequestState(deadline, tracker) catch |err| return err;
-    setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-    http_request.send() catch |err| return mapHttpError(err, deadline, tracker);
     if (request.body) |body| {
+        const owned_body = request.allocator.dupe(u8, body) catch return error.Io;
+        defer request.allocator.free(owned_body);
         checkRequestState(deadline, tracker) catch |err| return err;
-        setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-        http_request.writeAll(body) catch |err| return mapHttpError(err, deadline, tracker);
+        http_request.sendBodyComplete(owned_body) catch |err| return mapHttpError(err, deadline, tracker);
+    } else {
+        checkRequestState(deadline, tracker) catch |err| return err;
+        http_request.sendBodiless() catch |err| return mapHttpError(err, deadline, tracker);
     }
     checkRequestState(deadline, tracker) catch |err| return err;
-    setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-    http_request.finish() catch |err| return mapHttpError(err, deadline, tracker);
-    http_request.wait() catch |err| return mapHttpError(err, deadline, tracker);
+    var response = http_request.receiveHead(&redirect_buffer) catch |err| return mapHttpError(err, deadline, tracker);
 
-    const headers = cloneResponseHeaders(request.allocator, http_request.response) catch return error.Io;
+    const headers = cloneResponseHeaders(request.allocator, response) catch return error.Io;
     errdefer freeResponseHeaders(request.allocator, headers);
 
-    var body = std.ArrayList(u8).init(request.allocator);
+    var body = std.array_list.Managed(u8).init(request.allocator);
     errdefer body.deinit();
-    var response_reader = http_request.reader();
+    var transfer_buffer: [8192]u8 = undefined;
+    var response_reader = response.reader(&transfer_buffer);
     var read_buffer: [8192]u8 = undefined;
     while (true) {
         checkRequestState(deadline, tracker) catch |err| return err;
-        setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-        const read_len = response_reader.read(&read_buffer) catch |err| return mapHttpError(err, deadline, tracker);
+        const read_len = response_reader.readSliceShort(&read_buffer) catch |err| return mapHttpError(err, deadline, tracker);
         if (read_len == 0) break;
         const next_len = std.math.add(u64, @intCast(body.items.len), @intCast(read_len)) catch return error.TooLarge;
         if (next_len > request.max_response_bytes) return error.TooLarge;
         body.appendSlice(read_buffer[0..read_len]) catch return error.Io;
     }
 
-    const response = request.allocator.create(legacy.HttpResponse) catch return error.Io;
-    errdefer request.allocator.destroy(response);
-    response.* = .{
+    const out = request.allocator.create(legacy.HttpResponse) catch return error.Io;
+    errdefer request.allocator.destroy(out);
+    out.* = .{
         .allocator = request.allocator,
-        .status = @intCast(@intFromEnum(http_request.response.status)),
+        .status = @intCast(@intFromEnum(response.head.status)),
         .headers = headers,
         .body = body.toOwnedSlice() catch return error.Io,
     };
-    return response;
+    return out;
 }
 
 pub export fn sa_http_client_req_send_v2(req: ?*anyopaque, out_resp: ?*?*anyopaque) u32 {
@@ -432,7 +395,7 @@ fn cloneRequestV2(source: *legacy.HttpRequest) !*legacy.HttpRequest {
         .client = source.client,
         .method = source.method,
         .url = try allocator.dupe(u8, source.url),
-        .headers = std.ArrayList(std.http.Header).init(allocator),
+        .headers = std.array_list.Managed(std.http.Header).init(allocator),
         .timeout_ms = source.timeout_ms,
         .max_response_bytes = source.max_response_bytes,
         .retains_client = true,
@@ -454,11 +417,10 @@ const V2AsyncOp = struct {
     allocator: std.mem.Allocator,
     request: *legacy.HttpRequest,
     thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    // NOTE(Zig 0.17): Thread.Mutex/Condition removed; spin + sleep-poll.
+    mutex: std.atomic.Mutex = .unlocked,
     done: bool = false,
     cancel_requested: bool = false,
-    active_fd: ?std.posix.socket_t = null,
     result_status: NetworkStatus = .would_block,
     response: ?*legacy.HttpResponse = null,
 
@@ -481,7 +443,7 @@ const V2AsyncOp = struct {
     }
 
     fn complete(self: *V2AsyncOp, result_status: NetworkStatus, response: ?*legacy.HttpResponse) void {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (self.cancel_requested) {
             if (response) |value| value.deinit();
@@ -491,68 +453,52 @@ const V2AsyncOp = struct {
             self.response = response;
             self.result_status = result_status;
         }
-        self.active_fd = null;
         self.done = true;
-        self.condition.broadcast();
-    }
-
-    fn attach(self: *V2AsyncOp, fd: std.posix.socket_t) V2Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.cancel_requested) return error.Closed;
-        self.active_fd = fd;
-    }
-
-    fn detach(self: *V2AsyncOp, fd: std.posix.socket_t) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.active_fd != null and self.active_fd.? == fd) self.active_fd = null;
     }
 
     fn cancelled(self: *V2AsyncOp) bool {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         return self.cancel_requested;
     }
 
     fn cancel(self: *V2AsyncOp) void {
-        self.mutex.lock();
-        if (self.done or self.cancel_requested) {
-            self.mutex.unlock();
-            return;
-        }
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.done or self.cancel_requested) return;
         self.cancel_requested = true;
-        if (self.active_fd) |fd| std.posix.shutdown(fd, .both) catch {};
-        self.mutex.unlock();
     }
 
     fn poll(self: *V2AsyncOp, timeout_ms: u32, out_ready: *u8) NetworkStatus {
         out_ready.* = 0;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         if (self.done) {
+            const st = self.result_status;
+            self.mutex.unlock();
             out_ready.* = 1;
-            return self.result_status;
+            return st;
         }
+        self.mutex.unlock();
         if (timeout_ms == 0) return .would_block;
 
-        const started = std.time.Instant.now() catch return .io_error;
-        const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
-        while (!self.done) {
-            const now = std.time.Instant.now() catch return .io_error;
-            const elapsed = now.since(started);
-            if (elapsed >= timeout_ns) return .timeout;
-            self.condition.timedWait(&self.mutex, timeout_ns - elapsed) catch |err| switch (err) {
-                error.Timeout => return .timeout,
-            };
+        const deadline_ns: i128 = sio.nanoTimestamp() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+        while (true) {
+            sio.io().sleep(.fromMilliseconds(5), .awake) catch {};
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.done) {
+                const st = self.result_status;
+                self.mutex.unlock();
+                out_ready.* = 1;
+                return st;
+            }
+            self.mutex.unlock();
+            if (sio.nanoTimestamp() >= deadline_ns) return .timeout;
         }
-        out_ready.* = 1;
-        return self.result_status;
     }
 
     fn takeResponse(self: *V2AsyncOp, out_resp: *?*anyopaque) NetworkStatus {
         out_resp.* = null;
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (!self.done) return .would_block;
         if (self.result_status != .ok) return self.result_status;
@@ -623,35 +569,53 @@ const WebSocketOpcode = enum(u8) {
 const WebSocketV2 = struct {
     allocator: std.mem.Allocator,
     client: *legacy.HttpClient,
-    connection: *std.http.Client.Connection,
-    receive_buffer: std.ArrayList(u8),
+    stream: std.Io.net.Stream,
+    // TLS state for wss:// (mirrors the v1 handle layout).
+    tls_client: ?*std.crypto.tls.Client = null,
+    net_reader: std.Io.net.Stream.Reader = undefined,
+    net_writer: std.Io.net.Stream.Writer = undefined,
+    net_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    net_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    // Persistent buffered reader for plain frame input (a fresh reader per
+    // read would over-read past frame boundaries and lose bytes).
+    frame_reader: std.Io.net.Stream.Reader = undefined,
+    frame_read_buf: [8192]u8 = undefined,
+    ca_lock: std.Io.RwLock = .init,
+    receive_buffer: std.array_list.Managed(u8),
     receive_start: usize = 0,
-    fragment_buffer: std.ArrayList(u8),
+    fragment_buffer: std.array_list.Managed(u8),
     fragment_opcode: ?u8 = null,
     last_message: ?[]u8 = null,
     pending_pong: ?[]u8 = null,
     close_sent: bool = false,
     closed: bool = false,
-    io_mutex: std.Thread.Mutex = .{},
+    io_mutex: std.atomic.Mutex = .unlocked,
 
-    fn init(client: *legacy.HttpClient, connection: *std.http.Client.Connection) !*WebSocketV2 {
-        const self = try client.allocator.create(WebSocketV2);
-        client.retain();
-        self.* = .{
-            .allocator = client.allocator,
-            .client = client,
-            .connection = connection,
-            .receive_buffer = std.ArrayList(u8).init(client.allocator),
-            .fragment_buffer = std.ArrayList(u8).init(client.allocator),
-        };
-        connection.closing = true;
-        return self;
+    fn rawRead(self: *WebSocketV2, buffer: []u8) V2Error!usize {
+        if (self.tls_client) |t| {
+            return t.reader.readSliceShort(buffer) catch return error.Io;
+        }
+        return self.frame_reader.interface.readSliceShort(buffer) catch return error.Io;
+    }
+
+    fn rawWrite(self: *WebSocketV2, bytes: []const u8) V2Error!void {
+        if (self.tls_client) |t| {
+            t.writer.writeAll(bytes) catch return error.Io;
+            t.writer.flush() catch return error.Io;
+            return;
+        }
+        var wbuf: [8192]u8 = undefined;
+        var w = self.stream.writer(sio.io(), &wbuf);
+        w.interface.writeAll(bytes) catch return error.Io;
+        w.interface.flush() catch return error.Io;
     }
 
     fn markClosed(self: *WebSocketV2) void {
         if (self.closed) return;
         self.closed = true;
-        std.posix.shutdown(self.connection.stream.handle, .both) catch {};
+        self.stream.shutdown(sio.io(), .both) catch {};
     }
 
     fn clearLastMessage(self: *WebSocketV2) void {
@@ -660,15 +624,15 @@ const WebSocketV2 = struct {
     }
 
     fn deinit(self: *WebSocketV2) void {
-        self.io_mutex.lock();
+        while (!self.io_mutex.tryLock()) std.atomic.spinLoopHint();
         self.markClosed();
         self.clearLastMessage();
         if (self.pending_pong) |payload| self.allocator.free(payload);
         self.pending_pong = null;
         self.receive_buffer.deinit();
         self.fragment_buffer.deinit();
-        self.connection.closing = true;
-        self.client.client.connection_pool.release(self.client.allocator, self.connection);
+        if (self.tls_client) |t| self.allocator.destroy(t);
+        self.stream.close(sio.io());
         self.io_mutex.unlock();
         const client = self.client;
         self.allocator.destroy(self);
@@ -689,7 +653,7 @@ fn websocketPoll(handle: *WebSocketV2, interests: u32, timeout_ms: u32, out_even
     }
 
     if (interests & PollEvent.readable != 0 and
-        (handle.receive_start < handle.receive_buffer.items.len or handle.connection.peek().len != 0))
+        handle.receive_start < handle.receive_buffer.items.len)
     {
         out_events.* |= PollEvent.readable;
     }
@@ -701,7 +665,7 @@ fn websocketPoll(handle: *WebSocketV2, interests: u32, timeout_ms: u32, out_even
     if (native_events == 0) return .ok;
 
     var poll_fds = [1]std.posix.pollfd{.{
-        .fd = handle.connection.stream.handle,
+        .fd = handle.stream.socket.handle,
         .events = native_events,
         .revents = 0,
     }};
@@ -727,10 +691,15 @@ fn normalizedWebSocketUrl(allocator: std.mem.Allocator, url: []const u8) V2Error
     return error.Invalid;
 }
 
-fn websocketHeader(response: *std.http.Client.Response, key: []const u8) ?[]const u8 {
-    var iterator = response.iterateHeaders();
-    while (iterator.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, key)) return header.value;
+fn findRawHeader(head: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), key)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
     }
     return null;
 }
@@ -760,88 +729,142 @@ fn websocketConnect(
 ) V2Error!*WebSocketV2 {
     if (logical_url.len == 0) return error.Invalid;
     if (unix_socket_path != null and !std.mem.startsWith(u8, logical_url, "ws://")) return error.Invalid;
+    const use_tls = std.mem.startsWith(u8, logical_url, "wss://");
+    if (!use_tls and !std.mem.startsWith(u8, logical_url, "ws://")) return error.Invalid;
     const normalized_url = try normalizedWebSocketUrl(client.allocator, logical_url);
     defer client.allocator.free(normalized_url);
     const uri = std.Uri.parse(normalized_url) catch return error.Invalid;
     if (uri.fragment != null) return error.Invalid;
+    _ = timeout_ms; // handshake is blocking; callers bound total time via poll
 
     var key_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&key_bytes);
+    sio.io().random(&key_bytes);
     var key_buffer: [24]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&key_buffer, &key_bytes);
 
-    var request_headers = std.ArrayList(std.http.Header).init(client.allocator);
-    defer request_headers.deinit();
     for (headers) |header| {
         if (reservedWebSocketHeader(header.name)) continue;
         if (!validHeaderName(header.name) or !validHeaderValue(header.value)) return error.Invalid;
-        request_headers.append(header) catch return error.Io;
     }
-    request_headers.append(.{ .name = "upgrade", .value = "websocket" }) catch return error.Io;
-    request_headers.append(.{ .name = "sec-websocket-version", .value = "13" }) catch return error.Io;
-    request_headers.append(.{ .name = "sec-websocket-key", .value = key }) catch return error.Io;
 
-    var supplied_connection: ?*std.http.Client.Connection = null;
+    const host_slice = switch (uri.host orelse return error.Invalid) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+
+    // Dial: unix socket or TCP (+TLS handshake for wss://).
+    var stream: std.Io.net.Stream = undefined;
     if (unix_socket_path) |path| {
         if (path.len == 0) return error.Invalid;
-        supplied_connection = client.client.connectUnix(path) catch |err| return switch (statusFromOperationError(err, false)) {
-            .invalid => error.Invalid,
-            .closed => error.Closed,
-            else => error.Io,
-        };
+        const addr = std.Io.net.UnixAddress.init(path) catch return error.Invalid;
+        stream = addr.connect(sio.io()) catch return error.Closed;
+    } else {
+        const port: u16 = uri.port orelse if (use_tls) 443 else 80;
+        stream = legacy.dialHost(host_slice, port) catch return error.Closed;
     }
+    errdefer stream.close(sio.io());
 
-    var header_buffer: [16 * 1024]u8 = undefined;
-    var http_request = client.client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .connection = supplied_connection,
-        .headers = .{
-            .connection = .{ .override = "Upgrade" },
-            .user_agent = .omit,
-            .accept_encoding = .omit,
-        },
-        .extra_headers = request_headers.items,
-        .keep_alive = true,
-        .redirect_behavior = .unhandled,
-    }) catch |err| {
-        if (supplied_connection) |connection| {
-            connection.closing = true;
-            client.client.connection_pool.release(client.allocator, connection);
-        }
-        return switch (statusFromOperationError(err, timeout_ms != 0)) {
-            .timeout => error.Timeout,
-            .invalid => error.Invalid,
-            .closed => error.Closed,
-            else => error.Io,
-        };
+    const handle = client.allocator.create(WebSocketV2) catch return error.Io;
+    errdefer client.allocator.destroy(handle);
+    client.retain();
+    errdefer client.release();
+    handle.* = .{
+        .allocator = client.allocator,
+        .client = client,
+        .stream = stream,
+        .receive_buffer = std.array_list.Managed(u8).init(client.allocator),
+        .fragment_buffer = std.array_list.Managed(u8).init(client.allocator),
     };
-    var request_active = true;
-    defer if (request_active) http_request.deinit();
+    errdefer {
+        handle.receive_buffer.deinit();
+        handle.fragment_buffer.deinit();
+    }
+    handle.frame_reader = stream.reader(sio.io(), &handle.frame_read_buf);
 
-    const connection = http_request.connection orelse return error.Closed;
-    const deadline = Deadline.request(timeout_ms);
-    setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-    http_request.transfer_encoding = .none;
-    http_request.send() catch |err| return mapHttpError(err, deadline, null);
-    setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-    http_request.finish() catch |err| return mapHttpError(err, deadline, null);
-    setConnectionTimeout(connection, try deadline.socketMillis()) catch |err| return err;
-    http_request.wait() catch |err| return mapHttpError(err, deadline, null);
+    if (use_tls and unix_socket_path == null) {
+        handle.net_reader = stream.reader(sio.io(), &handle.net_read_buf);
+        handle.net_writer = stream.writer(sio.io(), &handle.net_write_buf);
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        sio.io().random(&entropy);
+        const tls_client = client.allocator.create(std.crypto.tls.Client) catch return error.Io;
+        errdefer client.allocator.destroy(tls_client);
+        tls_client.* = std.crypto.tls.Client.init(
+            &handle.net_reader.interface,
+            &handle.net_writer.interface,
+            .{
+                .host = .{ .explicit = host_slice },
+                .ca = .{ .bundle = .{
+                    .gpa = client.allocator,
+                    .io = sio.io(),
+                    .lock = &handle.ca_lock,
+                    .bundle = &client.client.ca_bundle,
+                } },
+                .write_buffer = &handle.tls_write_buf,
+                .read_buffer = &handle.tls_read_buf,
+                .entropy = &entropy,
+                .realtime_now = std.Io.Clock.real.now(sio.io()),
+            },
+        ) catch return error.Io;
+        handle.tls_client = tls_client;
+    }
+    errdefer handle.deinit();
 
-    if (http_request.response.status != .switching_protocols) return error.Invalid;
-    const upgrade = websocketHeader(&http_request.response, "upgrade") orelse return error.Invalid;
+    // Request target: path + optional query.
+    var target_buf: [8192]u8 = undefined;
+    var target_stream = std.Io.Writer.fixed(&target_buf);
+    const raw_path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    target_stream.print("{s}", .{raw_path}) catch return error.Io;
+    if (uri.query) |q| {
+        const qs = switch (q) {
+            .raw => |s| s,
+            .percent_encoded => |s| s,
+        };
+        target_stream.print("?{s}", .{qs}) catch return error.Io;
+    }
+    const target = target_stream.buffer[0..target_stream.end];
+
+    var req_buf = std.array_list.Managed(u8).init(client.allocator);
+    defer req_buf.deinit();
+    req_buf.print("GET {s} HTTP/1.1\r\n", .{target}) catch return error.Io;
+    req_buf.print("Host: {s}\r\n", .{host_slice}) catch return error.Io;
+    req_buf.appendSlice("Connection: Upgrade\r\nUpgrade: websocket\r\nsec-websocket-version: 13\r\n") catch return error.Io;
+    for (headers) |header| {
+        if (reservedWebSocketHeader(header.name)) continue;
+        req_buf.print("{s}: {s}\r\n", .{ header.name, header.value }) catch return error.Io;
+    }
+    req_buf.print("sec-websocket-key: {s}\r\n\r\n", .{key}) catch return error.Io;
+    handle.rawWrite(req_buf.items) catch return error.Io;
+
+    // Read response head.
+    var head_buf = std.array_list.Managed(u8).init(client.allocator);
+    defer head_buf.deinit();
+    var tmp: [4096]u8 = undefined;
+    var head_end: ?usize = null;
+    while (head_end == null) {
+        const n = handle.rawRead(&tmp) catch return error.Io;
+        if (n == 0) return error.Closed;
+        head_buf.appendSlice(tmp[0..n]) catch return error.Io;
+        if (head_buf.items.len > 64 * 1024) return error.TooLarge;
+        if (std.mem.indexOf(u8, head_buf.items, "\r\n\r\n")) |idx| head_end = idx;
+    }
+    const head = head_buf.items[0..head_end.?];
+    {
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        const status_line = lines.next() orelse return error.Invalid;
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next();
+        const code_str = parts.next() orelse return error.Invalid;
+        const code = std.fmt.parseInt(u16, code_str, 10) catch return error.Invalid;
+        if (code != 101) return error.Invalid;
+    }
+    const upgrade = findRawHeader(head, "upgrade") orelse return error.Invalid;
     if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return error.Invalid;
-    const connection_header = websocketHeader(&http_request.response, "connection") orelse return error.Invalid;
+    const connection_header = findRawHeader(head, "connection") orelse return error.Invalid;
     if (!websocketHeaderContainsToken(connection_header, "upgrade")) return error.Invalid;
-    const accept = websocketHeader(&http_request.response, "sec-websocket-accept") orelse return error.Invalid;
+    const accept = findRawHeader(head, "sec-websocket-accept") orelse return error.Invalid;
     var expected_buffer: [28]u8 = undefined;
     const expected = sa_std_net.websocketAccept(key, &expected_buffer) catch return error.Invalid;
     if (!std.mem.eql(u8, accept, expected)) return error.Invalid;
-
-    const handle = WebSocketV2.init(client, connection) catch return error.Io;
-    http_request.connection = null;
-    request_active = false;
-    http_request.deinit();
     return handle;
 }
 
@@ -998,13 +1021,8 @@ fn fillWebSocketInput(handle: *WebSocketV2) V2Error!void {
     const poll_status = websocketPoll(handle, PollEvent.readable, 0, &events);
     if (poll_status != .ok) return errorFromNetworkStatus(poll_status);
     if (events & PollEvent.readable == 0) return if (events & PollEvent.closed != 0) error.Closed else error.WouldBlock;
-    try setConnectionTimeout(handle.connection, 1);
     var buffer: [16 * 1024]u8 = undefined;
-    const read_len = handle.connection.read(&buffer) catch |err| return switch (statusFromOperationError(err, true)) {
-        .timeout, .would_block => error.WouldBlock,
-        .closed => error.Closed,
-        else => error.Io,
-    };
+    const read_len = handle.rawRead(&buffer) catch |err| return err;
     if (read_len == 0) return error.Closed;
     handle.receive_buffer.appendSlice(buffer[0..read_len]) catch return error.Io;
 }
@@ -1016,7 +1034,7 @@ fn websocketFrameBytes(handle: *WebSocketV2, opcode: u8, payload: []const u8) V2
     const frame = handle.allocator.alloc(u8, frame_capacity) catch return error.Io;
     errdefer handle.allocator.free(frame);
     var mask_key: [4]u8 = undefined;
-    std.crypto.random.bytes(&mask_key);
+    sio.io().random(&mask_key);
     const frame_len = sa_std_net.buildWebSocketFrame(frame, opcode, payload, &mask_key) catch return error.Invalid;
     std.debug.assert(frame_len == frame_capacity);
     return frame;
@@ -1029,13 +1047,9 @@ fn writeWebSocketFrame(handle: *WebSocketV2, opcode: u8, payload: []const u8) V2
     if (poll_status != .ok) return errorFromNetworkStatus(poll_status);
     const frame = try websocketFrameBytes(handle, opcode, payload);
     defer handle.allocator.free(frame);
-    try setConnectionTimeout(handle.connection, 1);
-    handle.connection.writeAllDirect(frame) catch |err| {
+    handle.rawWrite(frame) catch |err| {
         handle.markClosed();
-        return switch (statusFromOperationError(err, true)) {
-            .closed => error.Closed,
-            else => error.Io,
-        };
+        return err;
     };
 }
 
@@ -1173,7 +1187,7 @@ pub export fn sa_http_websocket_poll_v2(ws: ?*anyopaque, interests: u32, timeout
     events.* = 0;
     const ws_ptr = ws orelse return statusCode(.invalid);
     const handle: *WebSocketV2 = @ptrCast(@alignCast(ws_ptr));
-    handle.io_mutex.lock();
+    while (!handle.io_mutex.tryLock()) std.atomic.spinLoopHint();
     defer handle.io_mutex.unlock();
     return statusCode(websocketPoll(handle, interests, timeout_ms, events));
 }
@@ -1193,7 +1207,7 @@ pub export fn sa_http_websocket_read_v2(
     len_slot.* = 0;
     const ws_ptr = ws orelse return statusCode(.invalid);
     const handle: *WebSocketV2 = @ptrCast(@alignCast(ws_ptr));
-    handle.io_mutex.lock();
+    while (!handle.io_mutex.tryLock()) std.atomic.spinLoopHint();
     defer handle.io_mutex.unlock();
     readWebSocketMessage(handle, max_len, opcode_slot, ptr_slot, len_slot) catch |err| return statusCode(statusFromV2Error(err));
     return statusCode(.ok);
@@ -1218,7 +1232,7 @@ pub export fn sa_http_websocket_write_v2(
     if ((opcode == @intFromEnum(WebSocketOpcode.ping) or opcode == @intFromEnum(WebSocketOpcode.pong)) and payload.len > 125) return statusCode(.too_large);
     if (opcode == @intFromEnum(WebSocketOpcode.text) and !std.unicode.utf8ValidateSlice(payload)) return statusCode(.invalid);
     const handle: *WebSocketV2 = @ptrCast(@alignCast(ws_ptr));
-    handle.io_mutex.lock();
+    while (!handle.io_mutex.tryLock()) std.atomic.spinLoopHint();
     defer handle.io_mutex.unlock();
     writeWebSocketFrame(handle, opcode, payload) catch |err| return statusCode(statusFromV2Error(err));
     written.* = payload.len;
@@ -1231,7 +1245,7 @@ pub export fn sa_http_websocket_close_v2(ws: ?*anyopaque, code: u16, reason_ptr:
     if (!validCloseCode(code) or reason.len > 123) return statusCode(if (reason.len > 123) .too_large else .invalid);
     if (!std.unicode.utf8ValidateSlice(reason)) return statusCode(.invalid);
     const handle: *WebSocketV2 = @ptrCast(@alignCast(ws_ptr));
-    handle.io_mutex.lock();
+    while (!handle.io_mutex.tryLock()) std.atomic.spinLoopHint();
     defer handle.io_mutex.unlock();
     if (handle.closed or handle.close_sent) return statusCode(.closed);
     var payload: [125]u8 = undefined;

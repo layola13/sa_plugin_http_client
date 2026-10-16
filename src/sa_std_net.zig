@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const sa_net = @import("sa_net_primitives");
 
 pub const WebSocketFrame = struct {
@@ -29,9 +30,9 @@ pub fn buildWebSocketFrame(out: []u8, opcode: u8, payload: []const u8, mask: ?*c
     };
 }
 
-pub fn readWebSocketFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream, max_len: u64, expect_masked: bool) !WebSocketFrame {
+pub fn readWebSocketFrameAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_len: u64, expect_masked: bool) !WebSocketFrame {
     var header: [14]u8 = undefined;
-    try readExact(stream, header[0..2]);
+    try readExact(reader, header[0..2]);
 
     if ((header[0] & 0x70) != 0) return error.InvalidWebSocketFrame;
     const masked = (header[1] & 0x80) != 0;
@@ -40,18 +41,18 @@ pub fn readWebSocketFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Str
     var payload_len: u64 = header[1] & 0x7f;
     var header_len: usize = 2;
     if (payload_len == 126) {
-        try readExact(stream, header[2..4]);
+        try readExact(reader, header[2..4]);
         payload_len = std.mem.readInt(u16, header[2..4], .big);
         header_len = 4;
     } else if (payload_len == 127) {
-        try readExact(stream, header[2..10]);
+        try readExact(reader, header[2..10]);
         payload_len = std.mem.readInt(u64, header[2..10], .big);
         header_len = 10;
     }
 
     if (payload_len > max_len or payload_len > std.math.maxInt(usize)) return error.InvalidWebSocketFrame;
     if (masked) {
-        try readExact(stream, header[header_len .. header_len + 4]);
+        try readExact(reader, header[header_len .. header_len + 4]);
         header_len += 4;
     }
 
@@ -60,7 +61,7 @@ pub fn readWebSocketFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Str
     const frame = try allocator.alloc(u8, frame_len);
     defer allocator.free(frame);
     @memcpy(frame[0..header_len], header[0..header_len]);
-    if (payload_len_usize > 0) try readExact(stream, frame[header_len..frame_len]);
+    if (payload_len_usize > 0) try readExact(reader, frame[header_len..frame_len]);
 
     const parsed = try parseWebSocketFrame(frame);
     if (!parsed.fin or parsed.masked != expect_masked or parsed.frame_len != frame_len) return error.InvalidWebSocketFrame;
@@ -97,10 +98,10 @@ fn unmaskWebSocketPayload(payload: []u8, mask: [4]u8) !void {
     sa_net.unmaskFrame(payload, mask);
 }
 
-fn readExact(stream: std.net.Stream, buffer: []u8) !void {
+fn readExact(reader: *std.Io.Reader, buffer: []u8) !void {
     var offset: usize = 0;
     while (offset < buffer.len) {
-        const read_n = stream.read(buffer[offset..]) catch return error.EndOfStream;
+        const read_n = reader.readSliceShort(buffer[offset..]) catch return error.EndOfStream;
         if (read_n == 0) return error.EndOfStream;
         offset += read_n;
     }
