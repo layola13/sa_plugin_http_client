@@ -1,6 +1,7 @@
 const std = @import("std");
 const plugin = @import("plugin");
-const plugin_api = @import("plugin_api.zig");
+const plugin_api = @import("plugin_api");
+const sio = @import("sio");
 
 const CaptureStream = struct {
     buffer: *std.array_list.Managed(u8),
@@ -33,6 +34,95 @@ fn dupeZArgs(allocator: std.mem.Allocator, argv: []const []const u8) ![][*:0]con
 fn freeZArgs(allocator: std.mem.Allocator, argv: [][*:0]const u8) void {
     for (argv) |arg| allocator.free(std.mem.sliceTo(arg, 0));
     allocator.free(argv);
+}
+
+const TcpConn = struct {
+    stream: std.Io.net.Stream,
+
+    pub fn read(self: TcpConn, buffer: []u8) !usize {
+        if (buffer.len == 0) return 0;
+        return std.posix.read(self.stream.socket.handle, buffer) catch return error.EndOfStream;
+    }
+
+    pub fn writeAll(self: TcpConn, bytes: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = std.posix.write(self.stream.socket.handle, bytes[offset..]) catch return error.WriteFailed;
+            if (n == 0) return error.WriteFailed;
+            offset += n;
+        }
+    }
+};
+
+fn parseContentLength(head: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..sep], " \t"), "content-length")) {
+            return std.fmt.parseInt(usize, std.mem.trim(u8, line[sep + 1 ..], " \t"), 10) catch null;
+        }
+    }
+    return null;
+}
+
+fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const sep = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..sep], " \t"), name)) {
+            return std.mem.trim(u8, line[sep + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+fn requestTarget(head: []const u8) []const u8 {
+    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse return "";
+    var parts = std.mem.splitScalar(u8, head[0..line_end], ' ');
+    _ = parts.next();
+    return parts.next() orelse "";
+}
+
+fn readRawRequest(conn: TcpConn, buf: []u8) !struct { head_len: usize, total: usize } {
+    var total: usize = 0;
+    var head_end: ?usize = null;
+    while (total < buf.len) {
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
+            head_end = idx + 4;
+            break;
+        }
+        const n = try conn.read(buf[total..]);
+        if (n == 0) return error.EndOfStream;
+        total += n;
+    }
+    const hl = head_end orelse return error.HttpHeadersOversize;
+    const content_len = parseContentLength(buf[0..hl]) orelse 0;
+    while (total - hl < content_len) {
+        if (total >= buf.len) return error.HttpHeadersOversize;
+        const n = try conn.read(buf[total..]);
+        if (n == 0) return error.EndOfStream;
+        total += n;
+    }
+    return .{ .head_len = hl, .total = total };
+}
+
+fn toSioDir(d: std.Io.Dir) sio.Dir {
+    return .{ .inner = d };
+}
+
+fn runWithCapture(ctx: *const plugin_api.Context, argv: []const []const u8, out_list: *std.array_list.Managed(u8), err_list: *std.array_list.Managed(u8)) !?u8 {
+    var ofw = sio.ForwardWriter(sio.ManagedWriter).init(sio.managedWriter(out_list));
+    var efw = sio.ForwardWriter(sio.ManagedWriter).init(sio.managedWriter(err_list));
+    const out_w = ofw.writer();
+    const err_w = efw.writer();
+    const rc = try plugin.runHttpClientCommand(ctx, argv, out_w, err_w);
+    try out_w.flush();
+    try err_w.flush();
+    return rc;
 }
 
 fn spawnLoopbackServer(allocator: std.mem.Allocator, body: []const u8) !struct {
