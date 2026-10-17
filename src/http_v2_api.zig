@@ -812,7 +812,10 @@ fn websocketConnect(
     // Request target: path + optional query.
     var target_buf: [8192]u8 = undefined;
     var target_stream = std.Io.Writer.fixed(&target_buf);
-    const raw_path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    const raw_path: []const u8 = switch (uri.path) {
+        .raw => |s| if (s.len != 0) s else "/",
+        .percent_encoded => |s| if (s.len != 0) s else "/",
+    };
     target_stream.print("{s}", .{raw_path}) catch return error.Io;
     if (uri.query) |q| {
         const qs = switch (q) {
