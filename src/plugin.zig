@@ -219,9 +219,30 @@ fn runHttpStreamRequest(
     stderr: *std.Io.Writer,
     options: RequestOptions,
 ) anyerror!?u8 {
-    // NOTE(Zig 0.17): Client.open/send/wait removed; fetch with writer streams via same path.
-    // For CLI streaming we fetch fully then write out (preserves behavior for small SSE bodies).
-    return try runHttpRequest(ctx, stdout, stderr, options);
+    // NOTE(Zig 0.17): Client.open/send/wait removed; fetch fully then emit
+    // body only (no `status:` line) to preserve SSE streaming behavior.
+    var client: std.http.Client = .{ .allocator = ctx.allocator, .io = sio.io() };
+    defer client.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+
+    try configureHttpsTrust(&client, ctx, options.ca_bundle_path);
+    _ = client.fetch(.{
+        .location = .{ .url = options.url },
+        .method = options.method,
+        .payload = options.body,
+        .extra_headers = options.headers,
+        .response_writer = &aw.writer,
+        .keep_alive = false,
+    }) catch |err| {
+        try stderr.print("error: http request failed: {}\n", .{err});
+        return 1;
+    };
+
+    const body = aw.written();
+    if (body.len != 0) try stdout.writeAll(body);
+    return 0;
 }
 
 pub fn runHttpClientCommand(ctx: *const plugin_api.Context, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
