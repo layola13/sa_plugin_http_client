@@ -597,7 +597,12 @@ const WebSocketV2 = struct {
         if (self.tls_client) |t| {
             return t.reader.readSliceShort(buffer) catch return error.Io;
         }
-        return self.frame_reader.interface.readSliceShort(buffer) catch return error.Io;
+        // NOTE(Zig 0.17): Stream.Reader is unusable with the Threaded
+        // backend (same reason as sci sa_ws_client tcpRead); read the
+        // blocking socket fd directly with single-short-read shape.
+        // Callers loop on need_more; handshake preserves over-read bytes
+        // into receive_buffer explicitly.
+        return std.posix.read(self.stream.socket.handle, buffer) catch return error.Io;
     }
 
     fn rawWrite(self: *WebSocketV2, bytes: []const u8) V2Error!void {
@@ -851,6 +856,12 @@ fn websocketConnect(
         if (std.mem.indexOf(u8, head_buf.items, "\r\n\r\n")) |idx| head_end = idx;
     }
     const head = head_buf.items[0..head_end.?];
+    // Preserve any bytes pipelined after the handshake head (e.g. the
+    // first frame) into the frame input buffer instead of dropping them.
+    const pipelined = head_buf.items[head_end.? + 4 ..];
+    if (pipelined.len != 0) {
+        handle.receive_buffer.appendSlice(pipelined) catch return error.Io;
+    }
     {
         var lines = std.mem.splitSequence(u8, head, "\r\n");
         const status_line = lines.next() orelse return error.Invalid;
