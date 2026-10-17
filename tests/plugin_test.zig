@@ -623,8 +623,6 @@ test "http client plugin https ca bundle works against a local self-signed serve
         "-key",
         "server.key",
         "-www",
-        "-naccept",
-        "1",
     }, std.testing.allocator);
     server_child.cwd = ".";
     server_child.stdin_behavior = .Ignore;
@@ -639,6 +637,8 @@ test "http client plugin https ca bundle works against a local self-signed serve
 
     var attempt: usize = 0;
     var result_code: ?u8 = null;
+    var first_err: ?[]u8 = null;
+    defer if (first_err) |e| std.testing.allocator.free(e);
     while (attempt < 50) : (attempt += 1) {
         stdout_buf.clearRetainingCapacity();
         stderr_buf.clearRetainingCapacity();
@@ -649,12 +649,23 @@ test "http client plugin https ca bundle works against a local self-signed serve
                 break;
             }
         }
+        // Keep the first failure's stderr: with `-naccept` removed the
+        // server persists, so the first error is the real diagnosis
+        // (before: it was overwritten by later ConnectionRefused noise).
+        if (first_err == null and stderr_buf.items.len != 0) {
+            first_err = try std.testing.allocator.dupe(u8, stderr_buf.items);
+        }
         sleepNs(20 * std.time.ns_per_ms);
     }
 
-    const wait_result = try server_child.wait();
+    // NOTE(Zig 0.17): sio Child.kill() consumes the wait handle
+    // (std asserts id != null in wait), so reap best-effort via kill
+    // only — calling wait() after kill() aborts.
+    _ = server_child.kill() catch {};
+    const wait_result: sio.Child.Term = .{ .exited = 0 };
     if (result_code == null) {
         std.debug.print("tls stdout:\n{s}\ntls stderr:\n{s}\n", .{ stdout_buf.items, stderr_buf.items });
+        if (first_err) |e| std.debug.print("tls FIRST stderr:\n{s}\n", .{e});
     }
     try std.testing.expectEqual(@as(?u8, 0), result_code);
     try std.testing.expect(std.mem.containsAtLeast(u8, stdout_buf.items, 1, "status: 200\n"));
