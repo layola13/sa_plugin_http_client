@@ -102,12 +102,17 @@ pub const HttpClient = struct {
         if (cfg.ca_bundle_path) |bundle_path| {
             const abs_path = try sio.cwd().realpathAlloc(self.allocator, bundle_path);
             defer self.allocator.free(abs_path);
+            const now = std.Io.Clock.real.now(sio.io());
             try self.client.ca_bundle.addCertsFromFilePathAbsolute(
                 self.allocator,
                 sio.io(),
-                std.Io.Clock.real.now(sio.io()),
+                now,
                 abs_path,
             );
+            // NOTE(Zig 0.17): std.http.Client.fetch() rescans the OS trust
+            // store and SWAPS OUT our bundle when client.now == null. Pin now
+            // so the custom CA survives.
+            self.client.now = now;
         }
     }
 

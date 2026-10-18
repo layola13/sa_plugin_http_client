@@ -175,7 +175,10 @@ fn configureHttpsTrust(client: *std.http.Client, ctx: *const plugin_api.Context,
         const abs_path = try sio.cwd().realpathAlloc(ctx.allocator, bundle_path);
         defer ctx.allocator.free(abs_path);
         const io = sio.io();
-        try client.ca_bundle.addCertsFromFilePathAbsolute(ctx.allocator, io, std.Io.Clock.real.now(io), abs_path);
+        const now = std.Io.Clock.real.now(io);
+        try client.ca_bundle.addCertsFromFilePathAbsolute(ctx.allocator, io, now, abs_path);
+        // NOTE(Zig 0.17): fetch() rescans + swaps the bundle when now==null.
+        client.now = now;
     }
 }
 

@@ -1203,6 +1203,9 @@ test "http client v2 TLS websocket preserves TLS state after upgrade" {
     try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_free_v2(websocket));
     websocket = null;
 
-    _ = try server_child.wait();
+    // NOTE(Zig 0.17): sio Child.kill() consumes the wait handle, so
+    // wait() after kill() asserts. Reap via kill-only (server used
+    // -naccept 1 and exits on its own after serving one connection).
+    _ = server_child.kill() catch {};
     server_reaped = true;
 }
