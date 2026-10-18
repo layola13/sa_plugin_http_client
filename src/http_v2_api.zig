@@ -609,6 +609,7 @@ const WebSocketV2 = struct {
         if (self.tls_client) |t| {
             t.writer.writeAll(bytes) catch return error.Io;
             t.writer.flush() catch return error.Io;
+            self.net_writer.interface.flush() catch return error.Io;
             return;
         }
         var wbuf: [8192]u8 = undefined;

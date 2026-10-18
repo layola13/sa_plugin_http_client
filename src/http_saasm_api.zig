@@ -945,6 +945,7 @@ const WebSocketHandle = struct {
         if (self.tls_client) |t| {
             try t.writer.writeAll(bytes);
             try t.writer.flush();
+            try self.net_writer.interface.flush();
             return;
         }
         const stream = self.stream orelse return error.EndOfStream;
