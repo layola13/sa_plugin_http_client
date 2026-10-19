@@ -597,13 +597,19 @@ const WebSocketV2 = struct {
         if (self.tls_client) |t| {
             return t.reader.readSliceShort(buffer) catch return error.Io;
         }
-        return self.frame_reader.interface.readSliceShort(buffer) catch return error.Io;
+        // NOTE(Zig 0.17): Stream.Reader is unusable with the Threaded
+        // backend (same reason as sci sa_ws_client tcpRead); read the
+        // blocking socket fd directly with single-short-read shape.
+        // Callers loop on need_more; handshake preserves over-read bytes
+        // into receive_buffer explicitly.
+        return std.posix.read(self.stream.socket.handle, buffer) catch return error.Io;
     }
 
     fn rawWrite(self: *WebSocketV2, bytes: []const u8) V2Error!void {
         if (self.tls_client) |t| {
             t.writer.writeAll(bytes) catch return error.Io;
             t.writer.flush() catch return error.Io;
+            self.net_writer.interface.flush() catch return error.Io;
             return;
         }
         var wbuf: [8192]u8 = undefined;
@@ -812,7 +818,10 @@ fn websocketConnect(
     // Request target: path + optional query.
     var target_buf: [8192]u8 = undefined;
     var target_stream = std.Io.Writer.fixed(&target_buf);
-    const raw_path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    const raw_path: []const u8 = switch (uri.path) {
+        .raw => |s| if (s.len != 0) s else "/",
+        .percent_encoded => |s| if (s.len != 0) s else "/",
+    };
     target_stream.print("{s}", .{raw_path}) catch return error.Io;
     if (uri.query) |q| {
         const qs = switch (q) {
@@ -848,6 +857,12 @@ fn websocketConnect(
         if (std.mem.indexOf(u8, head_buf.items, "\r\n\r\n")) |idx| head_end = idx;
     }
     const head = head_buf.items[0..head_end.?];
+    // Preserve any bytes pipelined after the handshake head (e.g. the
+    // first frame) into the frame input buffer instead of dropping them.
+    const pipelined = head_buf.items[head_end.? + 4 ..];
+    if (pipelined.len != 0) {
+        handle.receive_buffer.appendSlice(pipelined) catch return error.Io;
+    }
     {
         var lines = std.mem.splitSequence(u8, head, "\r\n");
         const status_line = lines.next() orelse return error.Invalid;

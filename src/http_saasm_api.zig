@@ -102,12 +102,17 @@ pub const HttpClient = struct {
         if (cfg.ca_bundle_path) |bundle_path| {
             const abs_path = try sio.cwd().realpathAlloc(self.allocator, bundle_path);
             defer self.allocator.free(abs_path);
+            const now = std.Io.Clock.real.now(sio.io());
             try self.client.ca_bundle.addCertsFromFilePathAbsolute(
                 self.allocator,
                 sio.io(),
-                std.Io.Clock.real.now(sio.io()),
+                now,
                 abs_path,
             );
+            // NOTE(Zig 0.17): std.http.Client.fetch() rescans the OS trust
+            // store and SWAPS OUT our bundle when client.now == null. Pin now
+            // so the custom CA survives.
+            self.client.now = now;
         }
     }
 
@@ -940,6 +945,7 @@ const WebSocketHandle = struct {
         if (self.tls_client) |t| {
             try t.writer.writeAll(bytes);
             try t.writer.flush();
+            try self.net_writer.interface.flush();
             return;
         }
         const stream = self.stream orelse return error.EndOfStream;
@@ -1106,7 +1112,10 @@ pub export fn sa_http_client_websocket_connect(client: ?*anyopaque, url_ptr: ?[*
     // Request target: path + optional query.
     var target_buf: [8192]u8 = undefined;
     var target_stream = std.Io.Writer.fixed(&target_buf);
-    const raw_path: []const u8 = if (uri.path.raw.len != 0) uri.path.raw else "/";
+    const raw_path: []const u8 = switch (uri.path) {
+        .raw => |s| if (s.len != 0) s else "/",
+        .percent_encoded => |s| if (s.len != 0) s else "/",
+    };
     target_stream.print("{s}", .{raw_path}) catch return fail();
     if (uri.query) |q| {
         const qs = switch (q) {

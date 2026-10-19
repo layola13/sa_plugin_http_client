@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("sio", sio_module);
     const tests = b.addTest(.{
         .root_module = test_module,
+        .filters = b.option([]const []const u8, "test-filter", "Filter tests by name substring") orelse &.{},
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run plugin tests");
