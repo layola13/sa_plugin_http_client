@@ -1,5 +1,9 @@
 # SA HTTP Client Plugin
 
+> **Build requirement: Zig 0.17** — this plugin targets and is verified against **Zig 0.17.0**. Build and test with Zig 0.17; older toolchains such as 0.14.x are not supported.
+> 本插件需使用 **Zig 0.17** 编译与测试。
+
+
 `http-client` provides native HTTP/1.1, HTTPS, streaming responses, and WebSocket transports to SA programs. The original ABI remains available. The v2 ABI adds stable network statuses, request limits and cancellation, and WebSocket support over TCP, TLS, and Unix-domain sockets.
 
 ## Development
