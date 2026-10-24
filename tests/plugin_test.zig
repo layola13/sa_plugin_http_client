@@ -1,5 +1,6 @@
 const std = @import("std");
 const plugin = @import("plugin");
+const core = @import("sa_http_client");
 const plugin_api = @import("plugin_api");
 const sio = @import("sio");
 
@@ -261,34 +262,34 @@ test "http client saasm api exposes response headers" {
     }.run, .{ server, done_flag });
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_new(0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_new(0, &client));
+    defer _ = core.sa_http_client_free(client);
 
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/headers", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
     var req: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_new(client, 1, url.ptr, url.len, &req));
-    defer _ = plugin.sa_http_client_req_free(req);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_new(client, 1, url.ptr, url.len, &req));
+    defer _ = core.sa_http_client_req_free(req);
 
     var resp: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_send(req, &resp));
-    defer _ = plugin.sa_http_client_resp_free(resp);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_send(req, &resp));
+    defer _ = core.sa_http_client_resp_free(resp);
 
-    try std.testing.expectEqual(@as(u16, 418), plugin.sa_http_client_resp_status(resp));
+    try std.testing.expectEqual(@as(u16, 418), core.sa_http_client_resp_status(resp));
 
     const key = "content-type";
     var value_ptr: ?[*]const u8 = null;
     var value_len: u64 = 0;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_get_header(resp, key.ptr, key.len, &value_ptr, &value_len));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_resp_get_header(resp, key.ptr, key.len, &value_ptr, &value_len));
     try std.testing.expectEqualStrings("application/json", (value_ptr orelse return error.NullHeader)[0..@intCast(value_len)]);
 
     var body_ptr: ?[*]const u8 = null;
     var body_len: u64 = 0;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
     try std.testing.expectEqualStrings("{}", (body_ptr orelse return error.NullBody)[0..@intCast(body_len)]);
-    try std.testing.expectEqual(@as(u64, 2), plugin.sa_http_client_resp_body_len(resp));
-    const direct_body_ptr = plugin.sa_http_client_resp_body_ptr(resp) orelse return error.NullBody;
-    try std.testing.expectEqualStrings("{}", direct_body_ptr[0..@intCast(plugin.sa_http_client_resp_body_len(resp))]);
+    try std.testing.expectEqual(@as(u64, 2), core.sa_http_client_resp_body_len(resp));
+    const direct_body_ptr = core.sa_http_client_resp_body_ptr(resp) orelse return error.NullBody;
+    try std.testing.expectEqualStrings("{}", direct_body_ptr[0..@intCast(core.sa_http_client_resp_body_len(resp))]);
 
     thread.join();
     try std.testing.expect(done_flag.*);
@@ -334,23 +335,23 @@ test "http client saasm api builds joined upstream URL and OpenAI auth headers" 
     }.run, .{ server, target_seen, auth_seen });
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_new(0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_new(0, &client));
+    defer _ = core.sa_http_client_free(client);
 
     const target = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/openai/v1", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(target);
     const path = "/v1/models";
     var req: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_new_joined(client, 1, target.ptr, target.len, path.ptr, path.len, 1, &req));
-    defer _ = plugin.sa_http_client_req_free(req);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_new_joined(client, 1, target.ptr, target.len, path.ptr, path.len, 1, &req));
+    defer _ = core.sa_http_client_req_free(req);
 
     const api_key = "sk-test";
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_add_openai_auth(req, api_key.ptr, api_key.len));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_add_openai_auth(req, api_key.ptr, api_key.len));
 
     var resp: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_send(req, &resp));
-    defer _ = plugin.sa_http_client_resp_free(resp);
-    try std.testing.expectEqual(@as(u16, 200), plugin.sa_http_client_resp_status(resp));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_send(req, &resp));
+    defer _ = core.sa_http_client_resp_free(resp);
+    try std.testing.expectEqual(@as(u16, 200), core.sa_http_client_resp_status(resp));
 
     thread.join();
     try std.testing.expect(target_seen.*);
@@ -386,41 +387,41 @@ test "http client saasm async request poll and take response" {
     }.run, .{ server, done_flag });
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_new(0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_new(0, &client));
+    defer _ = core.sa_http_client_free(client);
 
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/async", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
     var req: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_new(client, 1, url.ptr, url.len, &req));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_new(client, 1, url.ptr, url.len, &req));
 
     var op: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_send_async(req, &op));
-    defer _ = plugin.sa_http_client_async_free(op);
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_send_async(req, &op));
+    defer _ = core.sa_http_client_async_free(op);
 
     // The async operation owns a request clone, so callers may release their handle.
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_free(req));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_free(req));
 
     var ready: u8 = 255;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_async_poll(op, &ready));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_async_poll(op, &ready));
     try std.testing.expectEqual(@as(u8, 0), ready);
 
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_async_poll(op, &ready));
+        try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_async_poll(op, &ready));
         if (ready == 1) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(u8, 1), ready);
 
     var resp: ?*anyopaque = null;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_async_take_response(op, &resp));
-    defer _ = plugin.sa_http_client_resp_free(resp);
-    try std.testing.expectEqual(@as(u16, 200), plugin.sa_http_client_resp_status(resp));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_async_take_response(op, &resp));
+    defer _ = core.sa_http_client_resp_free(resp);
+    try std.testing.expectEqual(@as(u16, 200), core.sa_http_client_resp_status(resp));
 
     var body_ptr: ?[*]const u8 = null;
     var body_len: u64 = 0;
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_resp_body_slice(resp, &body_ptr, &body_len));
     try std.testing.expectEqualStrings("async body", (body_ptr orelse return error.NullBody)[0..@intCast(body_len)]);
 
     thread.join();
@@ -704,23 +705,23 @@ fn spawnV2HttpServer(delay_ms: u64, status_line: []const u8, body: []const u8) !
 }
 
 test "http client v2 status values and invalid arguments are stable" {
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(plugin.NetworkStatus.ok));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(plugin.NetworkStatus.would_block));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(plugin.NetworkStatus.closed));
-    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(plugin.NetworkStatus.timeout));
-    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(plugin.NetworkStatus.too_large));
-    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(plugin.NetworkStatus.invalid));
-    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(plugin.NetworkStatus.io_error));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(core.NetworkStatus.ok));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(core.NetworkStatus.would_block));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(core.NetworkStatus.closed));
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(core.NetworkStatus.timeout));
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(core.NetworkStatus.too_large));
+    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(core.NetworkStatus.invalid));
+    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(core.NetworkStatus.io_error));
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
+    defer _ = core.sa_http_client_free(client);
 
     var request: ?*anyopaque = @ptrFromInt(1);
     const url = "http://127.0.0.1/";
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.invalid), plugin.sa_http_client_req_new_v2(client, 99, url.ptr, url.len, &request));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.invalid), core.sa_http_client_req_new_v2(client, 99, url.ptr, url.len, &request));
     try std.testing.expectEqual(@as(?*anyopaque, null), request);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.invalid), plugin.sa_http_client_req_set_max_response_bytes_v2(null, 0));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.invalid), core.sa_http_client_req_set_max_response_bytes_v2(null, 0));
 }
 
 test "http client v2 enforces request deadline and response limit" {
@@ -729,14 +730,14 @@ test "http client v2 enforces request deadline and response limit" {
     defer std.testing.allocator.free(delayed_url);
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
+    defer _ = core.sa_http_client_free(client);
     var request: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_new_v2(client, 1, delayed_url.ptr, delayed_url.len, &request));
-    defer _ = plugin.sa_http_client_req_free(request);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_set_timeout_v2(request, 20));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_new_v2(client, 1, delayed_url.ptr, delayed_url.len, &request));
+    defer _ = core.sa_http_client_req_free(request);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_set_timeout_v2(request, 20));
     var response: ?*anyopaque = @ptrFromInt(1);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.timeout), plugin.sa_http_client_req_send_v2(request, &response));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.timeout), core.sa_http_client_req_send_v2(request, &response));
     try std.testing.expectEqual(@as(?*anyopaque, null), response);
     delayed.thread.join();
     std.testing.allocator.destroy(delayed.server);
@@ -745,10 +746,10 @@ test "http client v2 enforces request deadline and response limit" {
     const oversized_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/large", .{oversized.server.socket.address.getPort()});
     defer std.testing.allocator.free(oversized_url);
     var limited_request: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_new_v2(client, 1, oversized_url.ptr, oversized_url.len, &limited_request));
-    defer _ = plugin.sa_http_client_req_free(limited_request);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_set_max_response_bytes_v2(limited_request, 8));
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.too_large), plugin.sa_http_client_req_send_v2(limited_request, &response));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_new_v2(client, 1, oversized_url.ptr, oversized_url.len, &limited_request));
+    defer _ = core.sa_http_client_req_free(limited_request);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_set_max_response_bytes_v2(limited_request, 8));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.too_large), core.sa_http_client_req_send_v2(limited_request, &response));
     try std.testing.expectEqual(@as(?*anyopaque, null), response);
     oversized.thread.join();
     std.testing.allocator.destroy(oversized.server);
@@ -760,26 +761,26 @@ test "http client v2 async cancel wakes IO and retains client lifetime" {
     defer std.testing.allocator.free(url);
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
     var request: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_new_v2(client, 1, url.ptr, url.len, &request));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_new_v2(client, 1, url.ptr, url.len, &request));
     var operation: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_send_async_v2(request, &operation));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_send_async_v2(request, &operation));
 
     // The operation owns a retained request/client pair.
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_req_free(request));
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_free(client));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_req_free(request));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_free(client));
     sleepNs(20 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_async_cancel_v2(operation));
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_async_cancel_v2(operation));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_async_cancel_v2(operation));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_async_cancel_v2(operation));
 
     var ready: u8 = 0;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.closed), plugin.sa_http_client_async_poll_v2(operation, 1000, &ready));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.closed), core.sa_http_client_async_poll_v2(operation, 1000, &ready));
     try std.testing.expectEqual(@as(u8, 1), ready);
     var response: ?*anyopaque = @ptrFromInt(1);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.closed), plugin.sa_http_client_async_take_response_v2(operation, &response));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.closed), core.sa_http_client_async_take_response_v2(operation, &response));
     try std.testing.expectEqual(@as(?*anyopaque, null), response);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_async_free_v2(operation));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_async_free_v2(operation));
 
     delayed.thread.join();
     std.testing.allocator.destroy(delayed.server);
@@ -790,15 +791,15 @@ test "http client v2 leaves redirects to the caller" {
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/redirect", .{redirect.server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
+    defer _ = core.sa_http_client_free(client);
     var request: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_new_v2(client, 1, url.ptr, url.len, &request));
-    defer _ = plugin.sa_http_client_req_free(request);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_new_v2(client, 1, url.ptr, url.len, &request));
+    defer _ = core.sa_http_client_req_free(request);
     var response: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_req_send_v2(request, &response));
-    defer _ = plugin.sa_http_client_resp_free(response);
-    try std.testing.expectEqual(@as(u16, 302), plugin.sa_http_client_resp_status(response));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_req_send_v2(request, &response));
+    defer _ = core.sa_http_client_resp_free(response);
+    try std.testing.expectEqual(@as(u16, 302), core.sa_http_client_resp_status(response));
     redirect.thread.join();
     std.testing.allocator.destroy(redirect.server);
 }
@@ -942,43 +943,43 @@ test "http client v2 TCP websocket polls fragments pongs masks and closes" {
     }.run, .{ server, &result });
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
     const url = try std.fmt.allocPrint(std.testing.allocator, "ws://127.0.0.1:{d}/events?client=codex-max", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
     var websocket: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket));
     // The WebSocket retains the client and remains valid after owner release.
-    try std.testing.expectEqual(@as(u32, 0), plugin.sa_http_client_free(client));
+    try std.testing.expectEqual(@as(u32, 0), core.sa_http_client_free(client));
 
     var events: u32 = 99;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.would_block), plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 0, &events));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.would_block), core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 0, &events));
     try std.testing.expectEqual(@as(u32, 0), events);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 1000, &events));
-    try std.testing.expect(events & plugin.PollEvent.readable != 0);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 1000, &events));
+    try std.testing.expect(events & core.PollEvent.readable != 0);
 
     var opcode: u8 = 0;
     var message_ptr: ?[*]const u8 = null;
     var message_len: u64 = 0;
-    var read_status = plugin.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len);
+    var read_status = core.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len);
     var attempts: usize = 0;
-    while (read_status == @intFromEnum(plugin.NetworkStatus.would_block) and attempts < 20) : (attempts += 1) {
-        _ = plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 100, &events);
-        read_status = plugin.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len);
+    while (read_status == @intFromEnum(core.NetworkStatus.would_block) and attempts < 20) : (attempts += 1) {
+        _ = core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 100, &events);
+        read_status = core.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len);
     }
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), read_status);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), read_status);
     try std.testing.expectEqual(@as(u8, 1), opcode);
     try std.testing.expectEqualStrings("hello", (message_ptr orelse return error.NullWebSocketMessage)[0..@intCast(message_len)]);
 
     const outbound = "client";
     var written: u64 = 99;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_write_v2(websocket, 1, outbound.ptr, outbound.len, &written));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_write_v2(websocket, 1, outbound.ptr, outbound.len, &written));
     try std.testing.expectEqual(@as(u64, outbound.len), written);
     const reason = "done";
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_close_v2(websocket, 1000, reason.ptr, reason.len));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_close_v2(websocket, 1000, reason.ptr, reason.len));
 
-    _ = plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 1000, &events);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.closed), plugin.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_free_v2(websocket));
+    _ = core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 1000, &events);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.closed), core.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_free_v2(websocket));
     thread.join();
     try std.testing.expect(result.pong_seen.load(.acquire));
     try std.testing.expect(result.text_seen.load(.acquire));
@@ -1009,22 +1010,22 @@ test "http client v2 Unix websocket uses socket endpoint and logical URL" {
     }.run, .{server});
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
+    defer _ = core.sa_http_client_free(client);
     const logical_url = "ws://localhost/daemon?engine=official";
     var websocket: ?*anyopaque = null;
     try std.testing.expectEqual(
-        @intFromEnum(plugin.NetworkStatus.ok),
-        plugin.sa_http_client_websocket_connect_unix_v2(client, socket_path.ptr, socket_path.len, logical_url.ptr, logical_url.len, 1000, &websocket),
+        @intFromEnum(core.NetworkStatus.ok),
+        core.sa_http_client_websocket_connect_unix_v2(client, socket_path.ptr, socket_path.len, logical_url.ptr, logical_url.len, 1000, &websocket),
     );
-    defer _ = plugin.sa_http_websocket_free_v2(websocket);
+    defer _ = core.sa_http_websocket_free_v2(websocket);
 
     var events: u32 = 0;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 1000, &events));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 1000, &events));
     var opcode: u8 = 0;
     var message_ptr: ?[*]const u8 = null;
     var message_len: u64 = 0;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
     try std.testing.expectEqual(@as(u8, 1), opcode);
     try std.testing.expectEqualStrings("unix-ok", (message_ptr orelse return error.NullWebSocketMessage)[0..@intCast(message_len)]);
 
@@ -1049,21 +1050,21 @@ test "http client v2 websocket rejects an oversized frame before allocation" {
     }.run, .{server});
 
     var client: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_new_v2(0, null, 0, &client));
-    defer _ = plugin.sa_http_client_free(client);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_new_v2(0, null, 0, &client));
+    defer _ = core.sa_http_client_free(client);
     const url = try std.fmt.allocPrint(std.testing.allocator, "ws://127.0.0.1:{d}/oversized", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(url);
     var websocket: ?*anyopaque = null;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket));
-    defer _ = plugin.sa_http_websocket_free_v2(websocket);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket));
+    defer _ = core.sa_http_websocket_free_v2(websocket);
     var events: u32 = 0;
-    _ = plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 1000, &events);
+    _ = core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 1000, &events);
     var opcode: u8 = 0;
     var message_ptr: ?[*]const u8 = null;
     var message_len: u64 = 0;
     try std.testing.expectEqual(
-        @intFromEnum(plugin.NetworkStatus.too_large),
-        plugin.sa_http_websocket_read_v2(websocket, plugin.max_v2_message_bytes, &opcode, &message_ptr, &message_len),
+        @intFromEnum(core.NetworkStatus.too_large),
+        core.sa_http_websocket_read_v2(websocket, core.max_v2_message_bytes, &opcode, &message_ptr, &message_len),
     );
     try std.testing.expectEqual(@as(?[*]const u8, null), message_ptr);
     thread.join();
@@ -1173,34 +1174,34 @@ test "http client v2 TLS websocket preserves TLS state after upgrade" {
 
     var client: ?*anyopaque = null;
     try std.testing.expectEqual(
-        @intFromEnum(plugin.NetworkStatus.ok),
-        plugin.sa_http_client_new_v2(1, certificate_path.ptr, certificate_path.len, &client),
+        @intFromEnum(core.NetworkStatus.ok),
+        core.sa_http_client_new_v2(1, certificate_path.ptr, certificate_path.len, &client),
     );
-    defer _ = plugin.sa_http_client_free(client);
+    defer _ = core.sa_http_client_free(client);
     const url = try std.fmt.allocPrint(std.testing.allocator, "wss://localhost:{d}/tls", .{port});
     defer std.testing.allocator.free(url);
     var websocket: ?*anyopaque = null;
     defer {
-        if (websocket) |value| _ = plugin.sa_http_websocket_free_v2(value);
+        if (websocket) |value| _ = core.sa_http_websocket_free_v2(value);
     }
-    var connect_status: u32 = @intFromEnum(plugin.NetworkStatus.io_error);
+    var connect_status: u32 = @intFromEnum(core.NetworkStatus.io_error);
     var attempt: usize = 0;
     while (attempt < 50) : (attempt += 1) {
-        connect_status = plugin.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket);
-        if (connect_status == @intFromEnum(plugin.NetworkStatus.ok)) break;
+        connect_status = core.sa_http_client_websocket_connect_v2(client, url.ptr, url.len, 1000, &websocket);
+        if (connect_status == @intFromEnum(core.NetworkStatus.ok)) break;
         sleepNs(20 * std.time.ns_per_ms);
     }
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), connect_status);
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), connect_status);
 
     var events: u32 = 0;
-    _ = plugin.sa_http_websocket_poll_v2(websocket, plugin.PollEvent.readable, 1000, &events);
+    _ = core.sa_http_websocket_poll_v2(websocket, core.PollEvent.readable, 1000, &events);
     var opcode: u8 = 0;
     var message_ptr: ?[*]const u8 = null;
     var message_len: u64 = 0;
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_read_v2(websocket, 64 * 1024, &opcode, &message_ptr, &message_len));
     try std.testing.expectEqual(@as(u8, 1), opcode);
     try std.testing.expectEqualStrings("tls-ok", (message_ptr orelse return error.NullWebSocketMessage)[0..@intCast(message_len)]);
-    try std.testing.expectEqual(@intFromEnum(plugin.NetworkStatus.ok), plugin.sa_http_websocket_free_v2(websocket));
+    try std.testing.expectEqual(@intFromEnum(core.NetworkStatus.ok), core.sa_http_websocket_free_v2(websocket));
     websocket = null;
 
     // NOTE(Zig 0.17): sio Child.kill() consumes the wait handle, so

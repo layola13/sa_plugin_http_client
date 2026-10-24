@@ -2,86 +2,9 @@ const std = @import("std");
 const plugin_api = @import("plugin_api");
 const plugin_helpers = @import("plugin_helpers.zig");
 const sio = @import("sio");
-const _http_api_v1 = @import("http_saasm_api.zig");
-const _http_api_v2 = @import("http_v2_api.zig");
-// NOTE(Zig 0.17): force emission of the api modules' `export fn` symbols
-// (plain `pub const` aliases alone are pruned, breaking `sa plugin install`
-// ABI verification).
-comptime {
-    _ = _http_api_v1;
-    _ = _http_api_v2;
-}
-// NOTE(Zig 0.17): `usingnamespace` was removed; explicit re-exports preserve plugin.* ABI.
-pub const SaHttpClientHandle = _http_api_v1.SaHttpClientHandle;
-pub const SaHttpRequestHandle = _http_api_v1.SaHttpRequestHandle;
-pub const SaHttpResponseHandle = _http_api_v1.SaHttpResponseHandle;
-pub const SaHttpBodyReaderHandle = _http_api_v1.SaHttpBodyReaderHandle;
-pub const HttpMethod = _http_api_v1.HttpMethod;
-pub const HttpClientConfig = _http_api_v1.HttpClientConfig;
-pub const HttpRequestConfig = _http_api_v1.HttpRequestConfig;
-pub const HttpClient = _http_api_v1.HttpClient;
-pub const HttpRequest = _http_api_v1.HttpRequest;
-pub const HttpResponse = _http_api_v1.HttpResponse;
-pub const HttpBodyReader = _http_api_v1.HttpBodyReader;
-pub const HttpRequestAsyncOp = _http_api_v1.HttpRequestAsyncOp;
-pub const sa_http_client_new = _http_api_v1.sa_http_client_new;
-pub const sa_http_client_req_new = _http_api_v1.sa_http_client_req_new;
-pub const sa_http_client_req_new_joined = _http_api_v1.sa_http_client_req_new_joined;
-pub const sa_http_client_req_add_header = _http_api_v1.sa_http_client_req_add_header;
-pub const sa_http_client_req_add_openai_auth = _http_api_v1.sa_http_client_req_add_openai_auth;
-pub const sa_http_client_req_set_body = _http_api_v1.sa_http_client_req_set_body;
-pub const sa_http_client_req_send = _http_api_v1.sa_http_client_req_send;
-pub const sa_http_client_req_send_async = _http_api_v1.sa_http_client_req_send_async;
-pub const sa_http_client_async_poll = _http_api_v1.sa_http_client_async_poll;
-pub const sa_http_client_async_take_response = _http_api_v1.sa_http_client_async_take_response;
-pub const sa_http_client_async_free = _http_api_v1.sa_http_client_async_free;
-pub const sa_http_client_resp_status = _http_api_v1.sa_http_client_resp_status;
-pub const sa_http_client_resp_get_header = _http_api_v1.sa_http_client_resp_get_header;
-pub const sa_http_client_resp_body_slice = _http_api_v1.sa_http_client_resp_body_slice;
-pub const sa_http_client_resp_body_ptr = _http_api_v1.sa_http_client_resp_body_ptr;
-pub const sa_http_client_resp_body_len = _http_api_v1.sa_http_client_resp_body_len;
-pub const sa_http_client_resp_body_reader = _http_api_v1.sa_http_client_resp_body_reader;
-pub const sa_http_client_resp_read_chunk = _http_api_v1.sa_http_client_resp_read_chunk;
-pub const sa_http_client_resp_free = _http_api_v1.sa_http_client_resp_free;
-pub const sa_http_client_body_reader_free = _http_api_v1.sa_http_client_body_reader_free;
-pub const sa_http_client_free = _http_api_v1.sa_http_client_free;
-pub const sa_http_client_req_free = _http_api_v1.sa_http_client_req_free;
-pub const sa_http_websocket_read = _http_api_v1.sa_http_websocket_read;
-pub const sa_http_websocket_write = _http_api_v1.sa_http_websocket_write;
-pub const sa_http_websocket_free = _http_api_v1.sa_http_websocket_free;
-pub const sa_http_client_websocket_connect = _http_api_v1.sa_http_client_websocket_connect;
-pub const sa_http_client_sse_post = _http_api_v1.sa_http_client_sse_post;
-pub const sa_http_client_sse_read = _http_api_v1.sa_http_client_sse_read;
-pub const sa_http_client_sse_poll = _http_api_v1.sa_http_client_sse_poll;
-pub const sa_http_client_sse_status = _http_api_v1.sa_http_client_sse_status;
-pub const sa_http_client_sse_free = _http_api_v1.sa_http_client_sse_free;
-pub const sa_http_client_sse_turn = _http_api_v1.sa_http_client_sse_turn;
-pub const sa_http_client_sse_turn_free = _http_api_v1.sa_http_client_sse_turn_free;
-pub const max_v2_message_bytes = _http_api_v2.max_v2_message_bytes;
-pub const default_v2_response_bytes = _http_api_v2.default_v2_response_bytes;
-pub const NetworkStatus = _http_api_v2.NetworkStatus;
-pub const PollEvent = _http_api_v2.PollEvent;
-pub const sa_http_client_new_v2 = _http_api_v2.sa_http_client_new_v2;
-pub const sa_http_client_req_new_v2 = _http_api_v2.sa_http_client_req_new_v2;
-pub const sa_http_client_req_add_header_v2 = _http_api_v2.sa_http_client_req_add_header_v2;
-pub const sa_http_client_req_set_body_v2 = _http_api_v2.sa_http_client_req_set_body_v2;
-pub const sa_http_client_req_set_timeout_v2 = _http_api_v2.sa_http_client_req_set_timeout_v2;
-pub const sa_http_client_req_set_max_response_bytes_v2 = _http_api_v2.sa_http_client_req_set_max_response_bytes_v2;
-pub const sa_http_client_req_send_v2 = _http_api_v2.sa_http_client_req_send_v2;
-pub const sa_http_client_req_send_async_v2 = _http_api_v2.sa_http_client_req_send_async_v2;
-pub const sa_http_client_async_poll_v2 = _http_api_v2.sa_http_client_async_poll_v2;
-pub const sa_http_client_async_take_response_v2 = _http_api_v2.sa_http_client_async_take_response_v2;
-pub const sa_http_client_async_cancel_v2 = _http_api_v2.sa_http_client_async_cancel_v2;
-pub const sa_http_client_async_free_v2 = _http_api_v2.sa_http_client_async_free_v2;
-pub const sa_http_client_websocket_connect_v2 = _http_api_v2.sa_http_client_websocket_connect_v2;
-pub const sa_http_client_websocket_connect_unix_v2 = _http_api_v2.sa_http_client_websocket_connect_unix_v2;
-pub const sa_http_client_req_websocket_connect_v2 = _http_api_v2.sa_http_client_req_websocket_connect_v2;
-pub const sa_http_client_req_websocket_connect_unix_v2 = _http_api_v2.sa_http_client_req_websocket_connect_unix_v2;
-pub const sa_http_websocket_poll_v2 = _http_api_v2.sa_http_websocket_poll_v2;
-pub const sa_http_websocket_read_v2 = _http_api_v2.sa_http_websocket_read_v2;
-pub const sa_http_websocket_write_v2 = _http_api_v2.sa_http_websocket_write_v2;
-pub const sa_http_websocket_close_v2 = _http_api_v2.sa_http_websocket_close_v2;
-pub const sa_http_websocket_free_v2 = _http_api_v2.sa_http_websocket_free_v2;
+// Framework plugin only: the HTTP/WebSocket client core (sa_http_client_*)
+// is built into sa_std (sci/src/runtime/sa_http_client.zig); this plugin wraps
+// it with CLI conveniences (sa http-client get/post/stream).
 
 const skills = [_]plugin_api.SkillSection{
     .{
@@ -97,9 +20,9 @@ const skills = [_]plugin_api.SkillSection{
             "loopback GET and body retrieval",
             "chunked SSE body streaming",
             "custom CA bundle loading",
-            "v2 request deadlines, response limits, and async cancellation",
-            "TCP, TLS, and Unix-domain WebSocket transports",
-            "pollable WebSocket reads and writes with stable network statuses",
+            "one-shot CLI fetches over std.http.Client",
+            "the sa_http_client_* core itself is built into sa_std",
+            
             "runtime descriptor and skills metadata",
         },
     },

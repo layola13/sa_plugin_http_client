@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("plugin", root_module);
     test_module.addImport("plugin_api", plugin_api);
     test_module.addImport("sio", sio_module);
+    const sa_http_client_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ sci_root, "src/runtime/sa_http_client.zig" })),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sa_http_client_module.addImport("sio", sio_module);
+    test_module.addImport("sa_http_client", sa_http_client_module);
     const tests = b.addTest(.{
         .root_module = test_module,
         .filters = b.option([]const []const u8, "test-filter", "Filter tests by name substring") orelse &.{},
