@@ -51,6 +51,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     sa_http_client_module.addImport("sio", sio_module);
+    const sa_net_primitives_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ sci_root, "src/runtime/sa_net_primitives.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
+    sa_http_client_module.addImport("sa_net_primitives", sa_net_primitives_module);
     test_module.addImport("sa_http_client", sa_http_client_module);
     const tests = b.addTest(.{
         .root_module = test_module,

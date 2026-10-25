@@ -15,27 +15,97 @@
       "path": "zig-out/lib/libhttp-client.so"
     }
   },
-  "interfaces": {
-    "sai": { "path": "sa_http_client.sai" }
-  },
-  "skills": ["http.client"],
+  "skills": [
+    "http.client"
+  ],
   "permissions": {
     "fs": [
-      { "op": "read", "path": "$PROJECT/**" },
-      { "op": "metadata", "path": "$PROJECT/**" },
-      { "op": "read", "path": "/etc/**" },
-      { "op": "metadata", "path": "/etc/**" },
-      { "op": "read", "path": "$HOME/.codex-max/**" },
-      { "op": "metadata", "path": "$HOME/.codex-max/**" },
-      { "op": "metadata", "path": "$SA_PLUGINS_HOME/**" }
+      {
+        "op": "read",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "metadata",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "read",
+        "path": "/etc/**"
+      },
+      {
+        "op": "metadata",
+        "path": "/etc/**"
+      },
+      {
+        "op": "read",
+        "path": "$HOME/.codex-max/**"
+      },
+      {
+        "op": "metadata",
+        "path": "$HOME/.codex-max/**"
+      },
+      {
+        "op": "metadata",
+        "path": "$SA_PLUGINS_HOME/**"
+      }
     ],
     "net": [
-      { "url": "https://*", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
-      { "url": "http://localhost", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
-      { "url": "http://127.0.0.1", "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] }
+      {
+        "url": "https://*",
+        "methods": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "HEAD",
+          "OPTIONS"
+        ]
+      },
+      {
+        "url": "http://localhost",
+        "methods": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "HEAD",
+          "OPTIONS"
+        ]
+      },
+      {
+        "url": "http://127.0.0.1",
+        "methods": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "HEAD",
+          "OPTIONS"
+        ]
+      }
     ],
-    "env": ["HOME", "TMPDIR", "TMP", "TEMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SA_*"],
-    "process": { "spawn": false, "exec": [] }
+    "env": [
+      "HOME",
+      "TMPDIR",
+      "TMP",
+      "TEMP",
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "no_proxy",
+      "SA_*"
+    ],
+    "process": {
+      "spawn": false,
+      "exec": []
+    }
   },
   "dependencies": {}
 }
