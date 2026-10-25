@@ -1,0 +1,27 @@
+{
+  "name": "sa-plugin-http-client",
+  "version": "0.2.0",
+  "description": "SA plugin: http-client. The plugin manifest is sap.json; install with: sa plugin install npm:sa-plugin-http-client@0.2.0",
+  "keywords": [
+    "sa-plugin",
+    "sa",
+    "sla"
+  ],
+  "files": [
+    "sap.json",
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "sa",
+    "*.sai",
+    "*.sal",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "tests"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {}
+}
